@@ -8,6 +8,18 @@ import { createRequire } from 'node:module'
 
 const pkgVersion = createRequire(import.meta.url)('./package.json').version
 
+// Stamp the real package version wherever __NOHMO_VERSION__ appears. A literal would
+// drift from package.json on every release. Applied to EVERY bundle, not just the
+// server one, because each SDK now reports its own version on the event envelope.
+const versionPlugin = {
+  name: 'nohmo-version',
+  transform(code) {
+    return code.includes('__NOHMO_VERSION__')
+      ? { code: code.replace(/__NOHMO_VERSION__/g, pkgVersion), map: null }
+      : null
+  },
+}
+
 // Kept external so they stay real requires in the bundle rather than being inlined or
 // shimmed. Both the bare and node:-prefixed forms, since either can appear in an import.
 const NODE_BUILTINS = [
@@ -37,6 +49,7 @@ export default [
       resolve({ browser: true }),
       commonjs(),
       typescript({ tsconfig: './tsconfig.build.json' }),
+      versionPlugin,
     ],
     external: ['react', 'react-dom'],
   },
@@ -66,6 +79,7 @@ export default [
       resolve(),
       commonjs(),
       typescript({ tsconfig: './tsconfig.build.json' }),
+      versionPlugin,
     ],
     external: [
       'react',
@@ -91,6 +105,7 @@ export default [
       resolve(),
       commonjs(),
       typescript({ tsconfig: './tsconfig.build.json' }),
+      versionPlugin,
     ],
     external: ['react', 'react-native'],
   },
@@ -121,16 +136,7 @@ export default [
       resolve({ preferBuiltins: true }),
       commonjs(),
       typescript({ tsconfig: './tsconfig.build.json' }),
-      // Stamp the real package version into the User-Agent so the ingest server can tell
-      // SDK versions apart. A literal here would drift from package.json on every release.
-      {
-        name: 'nohmo-version',
-        transform(code) {
-          return code.includes('__NOHMO_VERSION__')
-            ? { code: code.replace(/__NOHMO_VERSION__/g, pkgVersion), map: null }
-            : null
-        },
-      },
+      versionPlugin,
     ],
     external: NODE_BUILTINS,
   },
@@ -152,6 +158,7 @@ export default [
       commonjs(),
       typescript({ tsconfig: './tsconfig.build.json' }),
       terser(),
+      versionPlugin,
     ],
   },
 ]

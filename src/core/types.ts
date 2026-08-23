@@ -43,6 +43,12 @@ export interface NohmoEvent {
   referrer: string
   ts: number
   utm?: import('./utm').UTMParams
+  /** Which client library produced this event — 'web' | 'react-native' | 'flutter' |
+   *  'server'. Distinct from platform: a Flutter app and a React Native app both
+   *  report platform 'android', and without this the server cannot tell them apart. */
+  sdk?: string
+  /** The SDK's own package version, stamped at build time. */
+  sdkVersion?: string
 }
 
 export interface NohmoUser {

@@ -1,6 +1,11 @@
 import { AppState, Platform, Dimensions, Linking, NativeModules } from 'react-native'
 import type { NohmoRNConfig, NohmoRNEvent, NohmoStorage } from './types'
 
+// Identifies the client library on every event, so a Flutter app and a React Native app
+// both reporting platform 'android' can still be told apart server-side.
+const SDK_NAME = 'react-native'
+const SDK_VERSION = '__NOHMO_VERSION__'
+
 
 function makeMemoryStorage(): NohmoStorage {
   const store: Record<string, string> = {}
@@ -226,7 +231,7 @@ export class NohmoRNTracker {
 
       // Drain buffered pre-init events
       for (const e of this.pendingEvents) {
-        this.queue.push({ ...e, deviceId })
+        this.queue.push({ ...e, deviceId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
       }
       this.pendingEvents = []
       if (this.queue.length) this._schedulePersist()
@@ -341,7 +346,7 @@ export class NohmoRNTracker {
       return
     }
 
-    this.queue.push({ ...partial, deviceId: this.deviceId })
+    this.queue.push({ ...partial, deviceId: this.deviceId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
     this._schedulePersist()
     this._log('Event queued:', event)
   }
@@ -615,7 +620,7 @@ export class NohmoRNTracker {
       ...(Object.keys(this.installAttr).length > 0 ? { install_utm: this.installAttr } : {}),
     }
     if (!this.deviceId) { this.pendingEvents.push(partial); return }
-    this.queue.push({ ...partial, deviceId: this.deviceId })
+    this.queue.push({ ...partial, deviceId: this.deviceId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
     this._schedulePersist()
   }
 

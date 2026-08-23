@@ -33,6 +33,12 @@ export interface NohmoRNEvent {
   appVersion: string
   utm?: Record<string, string>
   install_utm?: Record<string, string>
+  /** Which client library produced this — 'react-native' here. Distinct from platform:
+   *  a Flutter app reports platform 'android' too, and without this the server cannot
+   *  tell which SDK sent a malformed payload. Cannot be backfilled later. */
+  sdk?: string
+  /** The SDK's own package version, stamped at build time. */
+  sdkVersion?: string
 }
 
 export interface NohmoRNContextValue {

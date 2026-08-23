@@ -5,6 +5,11 @@ import { EventQueue } from './queue'
 import type { NohmoConfig, NohmoEvent, NohmoState } from './types'
 import { getUTMParams } from './utm'
 
+// Identifies the client library on every event. __NOHMO_VERSION__ is replaced with the
+// real package version at build time by the rollup versionPlugin.
+const SDK_NAME = 'web'
+const SDK_VERSION = '__NOHMO_VERSION__'
+
 const _b = (s: string) => atob(s)
 const _h = _b('aHR0cHM6Ly93d3cubm9obW8uaW4=')
 const _p = {
@@ -114,7 +119,7 @@ export class NohmoTracker {
 
       // Drain events that were sent before init completed
       for (const e of this.pendingEvents) {
-        this.queue.push({ ...e, deviceId: canonicalId })
+        this.queue.push({ ...e, deviceId: canonicalId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
       }
       this.pendingEvents = []
 
@@ -174,7 +179,7 @@ export class NohmoTracker {
       return
     }
 
-    this.queue.push({ ...partial, deviceId: this.state.deviceId })
+    this.queue.push({ ...partial, deviceId: this.state.deviceId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
     this.log('Event queued:', event)
   }
 
