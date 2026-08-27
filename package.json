@@ -2,7 +2,7 @@
   "type": "module",
   "name": "nohmo",
   "version": "0.4.1",
-  "description": "Official analytics SDK for Nohmo — device tracking, session journeys, and event batching for React, Next.js, and React Native",
+  "description": "Official analytics SDK for Nohmo \u2014 device tracking, session journeys, and event batching for React, Next.js, and React Native",
   "main": "dist/index.cjs",
   "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
@@ -44,7 +44,8 @@
     "build": "rollup -c",
     "dev": "rollup -c --watch",
     "type-check": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "node --test --test-timeout 60000 test/*.test.mjs"
   },
   "peerDependencies": {
     "@react-native-async-storage/async-storage": ">=1.0.0",
@@ -70,6 +71,8 @@
     }
   },
   "devDependencies": {
+    "@babel/core": "^8.0.1",
+    "@babel/plugin-syntax-jsx": "^8.0.1",
     "@rollup/plugin-commonjs": "^25.0.0",
     "@rollup/plugin-node-resolve": "^15.0.0",
     "@rollup/plugin-terser": "^1.0.0",
@@ -97,7 +100,7 @@
   "homepage": "https://www.nohmo.in",
   "repository": {
     "type": "git",
-    "url": "https://github.com/prakhar2407/nohmo"
+    "url": "https://github.com/prakhar2407/nohmo-reactnative"
   },
   "engines": {
     "node": ">=20"

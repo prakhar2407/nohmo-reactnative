@@ -1,0 +1,53 @@
+name: JS SDK
+
+# Covers the npm package (web, React Native, server). The React Native tracker
+# is the part worth guarding hardest: it imports `react-native`, so nothing in a
+# normal test run loads it, and verifying it on a device needs a full Gradle or
+# Xcode build. test/react-native.test.mjs compiles the real source against a
+# stubbed react-native so the wire format is pinned without either.
+
+on:
+  push:
+    paths: ['src/**', 'test/**', 'babel-plugin.cjs', 'package.json', 'rollup.config.js', '.github/workflows/js.yml']
+  pull_request:
+    paths: ['src/**', 'test/**', 'babel-plugin.cjs', 'package.json', 'rollup.config.js', '.github/workflows/js.yml']
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run type-check
+      - run: npm run build
+      - run: npm test
+
+      # The version placeholder is substituted at build time. If that ever
+      # stops working, every event ships sdkVersion "__NOHMO_VERSION__" and the
+      # field is silently useless.
+      - name: Assert the version placeholder was substituted
+        run: |
+          if grep -q "__NOHMO_VERSION__" dist/react-native.esm.js; then
+            echo "::error::__NOHMO_VERSION__ was not replaced at build time"; exit 1
+          fi
+          VERSION=$(node -p "require('./package.json').version")
+          grep -q "$VERSION" dist/react-native.esm.js \
+            || { echo "::error::version $VERSION missing from the bundle"; exit 1; }
+
+      # package.json's `files` allowlist has swept Gradle build cache into the
+      # tarball before; this makes that loud instead of silent.
+      - name: Assert no build junk in the published tarball
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack.txt
+          if grep -qE "android/\.gradle|android/build/|\.lock|local\.properties" /tmp/pack.txt; then
+            echo "::error::build cache or machine-local files are in the npm tarball"; exit 1
+          fi

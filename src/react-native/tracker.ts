@@ -15,7 +15,7 @@ function makeMemoryStorage(): NohmoStorage {
   }
 }
 
-const _h = 'https://www.nohmo.in'
+const DEFAULT_HOST = 'https://www.nohmo.in'
 const _p = {
   i:   '/api/tracker/identify/',
   t:   '/api/tracker/track/',
@@ -49,7 +49,13 @@ function genId(prefix: string) {
   return `${prefix}_` + Math.random().toString(36).slice(2, 14) + Date.now().toString(36)
 }
 
-function parseDeepLinkUtm(url: string | null): Record<string, string> {
+/**
+ * Attribution exactly as it appeared in the URL — `utm_source`, `ref`, … — with
+ * no renaming. This shape is what the INSTALL_ATTRIBUTED event body and
+ * `install_utm` carry, because the dashboard's journey view renders that event
+ * by reading `data.utm_source` directly.
+ */
+function parseRawUtmParams(url: string | null): Record<string, string> {
   if (!url) return {}
   try {
     const params = new URLSearchParams(url.includes('?') ? url.split('?')[1] : '')
@@ -61,6 +67,40 @@ function parseDeepLinkUtm(url: string | null): Record<string, string> {
   } catch {
     return {}
   }
+}
+
+/**
+ * Session attribution, in the shape ingestion actually reads: `source`,
+ * `medium`, `campaign`, `term`, `content` — not the raw `utm_*` query names.
+ *
+ * This used to return the raw names, which meant process_events read
+ * `utm.source` off an object that only had `utm_source` and quietly wrote a
+ * blank source onto every mobile session. The web SDK has always sent the bare
+ * shape (see core/utm.ts); this brings React Native in line with it.
+ *
+ * A custom attribution param (`?ref=partner`) wins over utm_source/utm_medium,
+ * matching the web SDK; campaign, term and content are kept either way.
+ */
+function parseDeepLinkUtm(url: string | null): Record<string, string> {
+  const raw = parseRawUtmParams(url)
+  if (Object.keys(raw).length === 0) return {}
+
+  const utm: Record<string, string> = {}
+  const put = (key: string, value?: string) => { if (value) utm[key] = value }
+  put('source', raw.utm_source)
+  put('medium', raw.utm_medium)
+  put('campaign', raw.utm_campaign)
+  put('term', raw.utm_term)
+  put('content', raw.utm_content)
+
+  if (raw.ref) {
+    utm.source = raw.ref
+    utm.medium = 'ref'
+    // Only ever set when true — the backend coerces this with a plain
+    // truthiness check, so a literal 'false' would read as true.
+    utm._custom = '1'
+  }
+  return utm
 }
 
 // Pull the deep-link destination out of an incoming link URL — either an explicit
@@ -102,6 +142,15 @@ export class NohmoRNTracker {
   private deepLinkUtm: Record<string, string> = {}
   private installAttr: Record<string, string> = {}
   private installAttrAttempted = false
+  // Distinct from installAttrAttempted: that one is set even when the auto-read
+  // found nothing, to stop the empty probabilistic ping repeating. This one only
+  // becomes true once a real referrer string has been forwarded.
+  private installReferrerSent = false
+  // Whether we have actually been backgrounded. Without this, the 'active'
+  // AppState event that fires right after launch is treated as a return from
+  // background: every cold start minted a second session and a second APP_OPEN,
+  // stranding APP_INSTALL alone in a session with no other activity.
+  private backgrounded = false
   private inviteCache: Record<string, string> = {}
   // Resolved deep-link destination (OneLink-style) — from a direct link when the app
   // is already installed, or restored from the install match (deferred deep linking).
@@ -118,6 +167,7 @@ export class NohmoRNTracker {
       autoErrors: true,
       appVersion: '',
       storage: makeMemoryStorage(),
+      host: DEFAULT_HOST,
       ...config,
     }
     this.storage = this.config.storage
@@ -189,7 +239,7 @@ export class NohmoRNTracker {
       // Identify with backend
       try {
         const screen = Dimensions.get('screen')
-        const res = await fetch(`${_h}${_p.i}`, {
+        const res = await fetch(`${this.config.host}${_p.i}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
           body: JSON.stringify({
@@ -388,7 +438,7 @@ export class NohmoRNTracker {
     if (this.inviteCache[key]) return this.inviteCache[key]
 
     try {
-      const res = await fetch(`${_h}${_p.inv}`, {
+      const res = await fetch(`${this.config.host}${_p.inv}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({
@@ -400,7 +450,7 @@ export class NohmoRNTracker {
       })
       const data = await res.json()
       if (data && data.shortCode) {
-        const url = `${_h}/api/l/${data.shortCode}/`
+        const url = `${this.config.host}/api/l/${data.shortCode}/`
         this.inviteCache[key] = url
         return url
       }
@@ -422,7 +472,7 @@ export class NohmoRNTracker {
     add('utm_campaign', opts.campaign)
     add('utm_content', this.userId)
     const qs = parts.length ? `?${parts.join('&')}` : ''
-    return `${_h}/api/click/${this.config.projectId}/${qs}`
+    return `${this.config.host}/api/click/${this.config.projectId}/${qs}`
   }
 
   async linkUser(userId: string, email?: string, meta?: Record<string, unknown>): Promise<void> {
@@ -432,7 +482,7 @@ export class NohmoRNTracker {
     this._flush()
 
     try {
-      await fetch(`${_h}${_p.l}`, {
+      await fetch(`${this.config.host}${_p.l}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({
@@ -455,12 +505,20 @@ export class NohmoRNTracker {
     // hasn't fired yet at that point, so awaiting initPromise would hang forever).
     if (!this.deviceId) await this.initPromise
     if (!referrerString) return
-    // Guard covers both UTM-based and nohmo_click-only referrers
-    if (this.installAttrAttempted) return
+    // Guard on whether a REAL referrer has already gone out, not on whether the
+    // auto-read merely ran. On first open _autoReadInstallReferrer sets
+    // installAttrAttempted even when it found nothing, which silently swallowed
+    // every manual setInstallReferrer() call on the one launch where install
+    // attribution is still possible. Re-sending is safe: the backend returns the
+    // cached attribution once a device already has one.
+    if (this.installReferrerSent) return
+    this.installReferrerSent = true
     this.installAttrAttempted = true
 
-    // Parse UTM params for local storage / INSTALL_ATTRIBUTED event
-    const parsed = parseDeepLinkUtm('?' + referrerString)
+    // Raw `utm_*` names here, not the normalised ones: this map becomes the
+    // INSTALL_ATTRIBUTED body and `install_utm`, and the dashboard reads
+    // `data.utm_source` off it.
+    const parsed = parseRawUtmParams('?' + referrerString)
     if (Object.keys(parsed).length > 0) {
       this.installAttr = parsed
       await this.storage.setItem(KEYS.installAttr, JSON.stringify(parsed))
@@ -472,7 +530,7 @@ export class NohmoRNTracker {
     // even when the referrer contains no utm_* params. The response carries the
     // deferred deep-link destination (if the matched click had one).
     try {
-      const res = await fetch(`${_h}${_p.a}`, {
+      const res = await fetch(`${this.config.host}${_p.a}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({
@@ -550,7 +608,7 @@ export class NohmoRNTracker {
     if (this.installAttrAttempted) return
     this.installAttrAttempted = true
     try {
-      const res = await fetch(`${_h}${_p.a}`, {
+      const res = await fetch(`${this.config.host}${_p.a}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({
@@ -569,7 +627,7 @@ export class NohmoRNTracker {
     await this.initPromise
     if (!token || !this.deviceId) return
     try {
-      await fetch(`${_h}${_p.pt}`, {
+      await fetch(`${this.config.host}${_p.pt}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({ deviceId: this.deviceId, pushToken: token }),
@@ -680,7 +738,14 @@ export class NohmoRNTracker {
   }
 
   private _onAppStateChange = (nextState: string) => {
-    if (nextState === 'background' || nextState === 'inactive') {
+    // 'inactive' is deliberately not treated as backgrounding. On iOS it fires
+    // transiently — Control Centre, the notification shade, a permission sheet —
+    // and acting on it mints a new session every time the user glances away,
+    // shredding real sessions into one-event fragments. 'background' is the
+    // state that actually means backgrounded, and it fires on both platforms.
+    if (nextState === 'background') {
+      if (this.backgrounded) return
+      this.backgrounded = true
       const secs = Math.round((Date.now() - this.sessionStart) / 1000)
       if (secs > 0) {
         this.send('APP_BACKGROUND', {
@@ -693,6 +758,10 @@ export class NohmoRNTracker {
       // before the OS may kill the process, and the flush might not complete.
       void this._persistQueue().then(() => this._flush())
     } else if (nextState === 'active') {
+      // Only a genuine return from background starts a new session; the
+      // 'active' that arrives moments after launch is not one.
+      if (!this.backgrounded) return
+      this.backgrounded = false
       this.sessionId = genId('sess')
       this.sessionStart = Date.now()
       this._syncCrashContext()
@@ -748,6 +817,12 @@ export class NohmoRNTracker {
         // metric. Sending the platform lets the device be created correctly the first
         // time, instead of relying on a later /identify to come back and repair it.
         platform: e.platform,
+        // Also stamped on the queued event and also dropped here until now.
+        // Ingestion reads the SDK name off the event batch (not off /identify),
+        // so without these every React Native device was indistinguishable from
+        // a Flutter one and `sdk` stayed empty on every Device row.
+        sdk: e.sdk,
+        sdkVersion: e.sdkVersion,
         ...(e.utm ? { utm: e.utm } : {}),
         ...(e.install_utm ? { install_utm: e.install_utm } : {}),
       })),
@@ -755,7 +830,7 @@ export class NohmoRNTracker {
     })
 
     try {
-      const res = await fetch(`${_h}${_p.t}`, {
+      const res = await fetch(`${this.config.host}${_p.t}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,

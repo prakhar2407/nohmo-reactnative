@@ -18,6 +18,11 @@ export interface NohmoRNConfig {
    */
   autoErrors?: boolean
   storage?: NohmoStorage
+  /**
+   * Ingestion host. Only change this if you run a self-hosted Nohmo, or to
+   * point a test build at a local server. Matches the Flutter SDK's `host`.
+   */
+  host?: string
 }
 
 export interface NohmoRNEvent {

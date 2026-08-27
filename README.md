@@ -1,6 +1,6 @@
 # nohmo
 
-Official analytics SDK for [Nohmo](https://www.nohmo.in) — device tracking, session journeys, UTM attribution, and real-time event streaming for React, Next.js, and plain HTML / Django templates.
+Official analytics SDK for [Nohmo](https://www.nohmo.in) — device tracking, session journeys, UTM attribution, and real-time event streaming for React, Next.js, React Native, Flutter, and plain HTML / Django templates.
 
 ## Install
 
@@ -324,6 +324,7 @@ function PushTokenRegistrar() {
 | `debug` | `boolean` | `false` | Log all SDK activity to the console |
 | `autoAppLifecycle` | `boolean` | `true` | Auto-track `APP_OPEN` and `APP_BACKGROUND` on foreground/background transitions |
 | `autoErrors` | `boolean` | `true` | Capture JS errors (`JS_ERROR`) and crashes (`APP_CRASH`) — including native Android/iOS crashes |
+| `host` | `string` | `https://www.nohmo.in` | Ingestion host. Only change this if you run a self-hosted Nohmo, or to point a test build at a local server. |
 | `storage` | `NohmoStorage` | in-memory | Provide an AsyncStorage-compatible object to persist device identity across app restarts. Pass `AsyncStorage` from `@react-native-async-storage/async-storage`. Without this, a new device ID is generated on every cold start. |
 
 ### Autocapture (press events)
@@ -502,6 +503,45 @@ When the invitee installs through the link, their device's attribution shows the
 
 ---
 
+## Flutter (iOS & Android)
+
+The Flutter SDK is a separate package with the same feature set as the React
+Native one — screens, taps, install attribution, Smart Links and crash
+reporting. It lives in its own repository,
+[nohmo-sdk-flutter](https://github.com/prakhar2407/nohmo-sdk-flutter), and is
+published to pub.dev as [`nohmo`](https://pub.dev/packages/nohmo).
+
+```yaml
+# pubspec.yaml
+dependencies:
+  nohmo: ^0.4.1
+```
+
+```dart
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Nohmo.init(projectId: 'proj_xxxx', apiKey: 'pk_xxxx');
+  runApp(const MyApp());
+}
+
+MaterialApp(
+  navigatorObservers: [Nohmo.observer],                      // SCREEN_VIEW + TIME_SPENT
+  builder: (context, child) => NohmoAutocapture(child: child!),  // PRESS / LONG_PRESS / RAGE_CLICK
+);
+```
+
+Flutter has no Babel plugin, so tap autocapture works differently: instead of
+rewriting source at build time, `NohmoAutocapture` watches pointer events at the
+root and walks the render tree to the tap point to find the widget that was
+actually hit. Everything else — batching, the crash-surviving queue, attribution,
+deferred deep linking — behaves identically to React Native.
+
+Full guide: the
+[Flutter SDK README](https://github.com/prakhar2407/nohmo-sdk-flutter#readme).
+
+
+---
+
 ## Track conversions
 
 Conversions let you measure what matters — signups, deposits, purchases — and see exactly which traffic source (Google Ads, Meta Ads, organic, etc.) drove each one.
@@ -568,6 +608,14 @@ Attribution is automatic — if the user arrived via `?utm_source=google&utm_med
 | `DEAD_CLICK` | A click on a link/button that caused **nothing** — no navigation, no content change, no request | `tag`, `text`, `selector`, `waitedMs` |
 | `EMPTY_RESPONSE` | A request that succeeded (2xx) but came back empty — `[]`, `{}`, `null`, or `{"data": []}` | `status`, `method`, `url`, `bytes` |
 | `USER_LINKED` | When `linkUser()` is called | `email` |
+
+### Sessions
+
+A session starts at launch and ends when the app is backgrounded; returning to
+the foreground starts a new one. Only a genuine `background` counts — iOS also
+reports `inactive` when Control Centre or the notification shade is pulled
+down, and treating that as a backgrounding would split one real session into
+many single-event fragments.
 
 Disable any category via the `options` prop.
 

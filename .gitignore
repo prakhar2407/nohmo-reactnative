@@ -3,3 +3,9 @@ dist/
 *.log
 .env
 .claude/
+
+# Gradle build cache inside the RN native module — machine-local state that
+# package.json's `files` allowlist would otherwise sweep into the npm tarball.
+android/.gradle/
+android/build/
+android/local.properties
