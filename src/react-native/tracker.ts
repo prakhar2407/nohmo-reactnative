@@ -45,6 +45,21 @@ const KEYS = {
 // write; the newest are kept, since an ancient un-flushed event is the least useful.
 const MAX_PERSISTED_EVENTS = 500
 
+// Screen tracking failing is invisible from the outside: events keep flowing, they just
+// all carry whatever screen was current when tracking stopped updating. A broken setup
+// and a working one look identical, which is how it survives to production. So the
+// tracker watches its own event stream and says something when the shape is wrong.
+//
+// Both thresholds must be crossed before warning: enough events that the app is clearly
+// being used, and enough elapsed time that a real app would have changed screen at least
+// once. A burst of taps on the launch screen alone must not trigger it.
+const NAV_CHECK_MIN_EVENTS = 12
+const NAV_CHECK_MIN_MS = 30_000
+
+// Metro strips `if (__DEV__)` from release bundles, so this whole check costs shipping
+// apps nothing. Guarded with typeof for non-RN hosts (tests, web) where it is undefined.
+const IS_DEV = typeof __DEV__ !== 'undefined' && __DEV__
+
 function genId(prefix: string) {
   return `${prefix}_` + Math.random().toString(36).slice(2, 14) + Date.now().toString(36)
 }
@@ -158,6 +173,11 @@ export class NohmoRNTracker {
   private deepLinkListeners: ((value: string) => void)[] = []
   private linkingSub: { remove: () => void } | null = null
   private prevErrorHandler: ((error: Error, isFatal?: boolean) => void) | null = null
+  // Counters behind the dev-only screen-tracking check. See NAV_CHECK_MIN_EVENTS.
+  private screenViewCount = 0
+  private nonScreenEventCount = 0
+  private navWiringChecked = false
+  private readonly startedAt = Date.now()
 
   constructor(config: NohmoRNConfig) {
     this.config = {
@@ -165,6 +185,7 @@ export class NohmoRNTracker {
       debug: false,
       autoAppLifecycle: true,
       autoErrors: true,
+      setupWarnings: true,
       appVersion: '',
       storage: makeMemoryStorage(),
       host: DEFAULT_HOST,
@@ -376,6 +397,12 @@ export class NohmoRNTracker {
   }
 
   send(event: string, data: Record<string, unknown> = {}) {
+    // Counted before the pre-init buffering branch below: this measures what the app
+    // produced, not what was delivered.
+    if (event === 'SCREEN_VIEW') this.screenViewCount++
+    else this.nonScreenEventCount++
+    if (IS_DEV && this.config.setupWarnings) this._checkScreenTrackingWired()
+
     const partial: PartialEvent = {
       userId: this.userId,
       sessionId: this.sessionId,
@@ -848,6 +875,55 @@ export class NohmoRNTracker {
       this._log('Flush failed, re-queued:', err)
       await this._persistQueue()
     }
+  }
+
+  /**
+   * Warn once, in development only, when the event stream says screen tracking never
+   * got wired up.
+   *
+   * The signature is unmistakable: a busy app that has produced at most one SCREEN_VIEW.
+   * One means the launch screen was captured (an injected `onReady`, or a single manual
+   * call) and nothing has updated it since; zero means nothing is wired at all. Either
+   * way `currentScreen` is frozen, so every event from here on is stamped with a screen
+   * the user left long ago, and TIME_SPENT — which only fires on a screen CHANGE — never
+   * fires at all.
+   *
+   * This is deliberately downstream of every cause. Whether the Babel plugin skipped a
+   * container it could not match, the app uses Expo Router or React Navigation's static
+   * API, or someone simply never wired it — the symptom here is identical, so this
+   * catches failure modes we have not thought of yet.
+   */
+  private _checkScreenTrackingWired() {
+    if (this.navWiringChecked) return
+    if (this.nonScreenEventCount < NAV_CHECK_MIN_EVENTS) return
+    if (Date.now() - this.startedAt < NAV_CHECK_MIN_MS) return
+
+    // Whatever the verdict, only run this once per tracker.
+    this.navWiringChecked = true
+    if (this.screenViewCount > 1) return // healthy — screens are changing
+
+    const seen = this.screenViewCount === 0
+      ? 'no SCREEN_VIEW events at all'
+      : `only 1 SCREEN_VIEW (${this.currentScreen || 'unnamed'})`
+
+    // Two fixes, because not every app uses React Navigation. Naming only the
+    // navigation one would be useless advice to an app that routes with its own state.
+    console.warn(
+      `[Nohmo] Screen tracking does not look wired up.\n\n` +
+      `${this.nonScreenEventCount} events this session but ${seen}, so every event is ` +
+      `being stamped with that screen and TIME_SPENT will never fire.\n\n` +
+      `Using React Navigation? The usual cause is a container the Babel plugin could ` +
+      `not instrument — most often one that already has an onStateChange prop, but ` +
+      `also Expo Router and createStaticNavigation, which it cannot see:\n` +
+      `  import { onNohmoStateChange } from 'nohmo/react-native/autocapture'\n` +
+      `  <NavigationContainer onStateChange={(s) => { onNohmoStateChange(s); yourHandler?.(s) }}>\n\n` +
+      `Not using React Navigation? Call useScreenView on each screen:\n` +
+      `  import { useScreenView } from 'nohmo/react-native'\n` +
+      `  useScreenView('Home')\n\n` +
+      `One screen by design, or not tracking screens on purpose? Silence this with ` +
+      `setupWarnings: false in your NohmoProvider options.\n\n` +
+      `This warning is development-only.`
+    )
   }
 
   private _log(...args: unknown[]) {

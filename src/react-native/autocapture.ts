@@ -65,6 +65,37 @@ export function makeNohmoReadyHandler(
   }
 }
 
+/**
+ * Compose Nohmo's screen tracking with an `onStateChange` the app already passes.
+ *
+ * The plugin used to skip injection entirely when the prop was already set, which is
+ * silent and total: you keep the one SCREEN_VIEW that `onReady` captures at startup and
+ * never get another for the rest of the session. An app with its own onStateChange is
+ * common (its own analytics, a screen-title sync), so the skip hit exactly the apps that
+ * were already thinking about navigation. Nohmo runs first, then the app's handler.
+ */
+export function composeNohmoStateChange<T extends ((state: any) => unknown) | null | undefined>(
+  userHandler: T
+): (state: any) => unknown {
+  return (state: any) => {
+    onNohmoStateChange(state)
+    return (userHandler as ((s: any) => unknown) | null | undefined)?.(state)
+  }
+}
+
+/** Same composition for `onReady`, which additionally needs the navigationRef to read
+ *  the initial route. */
+export function composeNohmoReady<T extends ((...args: any[]) => unknown) | null | undefined>(
+  userHandler: T,
+  navigationRef: { current: { getCurrentRoute: () => { name: string } | undefined } | null }
+): (...args: any[]) => unknown {
+  const nohmoReady = makeNohmoReadyHandler(navigationRef)
+  return (...args: any[]) => {
+    nohmoReady()
+    return (userHandler as ((...a: any[]) => unknown) | null | undefined)?.(...args)
+  }
+}
+
 // ── Press autocapture (injected by babel-plugin) ───────────────────────────
 
 /**

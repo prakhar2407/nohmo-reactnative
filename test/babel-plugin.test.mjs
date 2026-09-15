@@ -96,6 +96,122 @@ describe('babel plugin — navigation', () => {
     assert.match(out, /onStateChange|__nohmoNavStateChange/,
       'NavigationContainer was not instrumented')
   })
+
+  // The regression these guard: the plugin used to SKIP injection when the prop was
+  // already set. That failure is silent and total — onReady still captures the launch
+  // screen, so the app reports exactly one SCREEN_VIEW per session and never another,
+  // which reads like "screen tracking sort of works" rather than "screen tracking is off".
+  test('composes with an onStateChange the app already passes', () => {
+    const out = compile(`
+      export default () => (
+        <NavigationContainer ref={navRef} onStateChange={handleNav}><Stack /></NavigationContainer>
+      )
+    `)
+    assert.match(out, /__nohmoComposeState\(handleNav\)/,
+      "the app's own onStateChange was not composed with Nohmo's")
+    assert.match(out, /composeNohmoStateChange/, 'compose helper was not imported')
+  })
+
+  test("composes with the app's own onReady, keeping the ref", () => {
+    const out = compile(`
+      export default () => (
+        <NavigationContainer ref={navRef} onReady={() => hideSplash()}><Stack /></NavigationContainer>
+      )
+    `)
+    assert.match(out, /__nohmoComposeReady\(/, "the app's own onReady was not composed")
+    assert.match(out, /__nohmoComposeReady\([\s\S]*?navRef\)/,
+      'the navigationRef was not threaded into the composed onReady')
+  })
+
+  test('both props already set — both are composed, neither is dropped', () => {
+    const out = compile(`
+      export default () => (
+        <NavigationContainer ref={navRef} onStateChange={(s) => log(s)} onReady={boot}>
+          <Stack />
+        </NavigationContainer>
+      )
+    `)
+    assert.match(out, /__nohmoComposeState\(/, 'onStateChange was not composed')
+    assert.match(out, /__nohmoComposeReady\(boot,/, 'onReady was not composed')
+    assert.match(out, /log\(s\)/, "the app's own handler was dropped")
+  })
+
+  test('no usable ref — onStateChange still composes, onReady is left alone', () => {
+    // onReady needs a named ref to read the initial route; a container without one
+    // must still get navigation tracking rather than nothing.
+    const out = compile(`
+      export default () => (
+        <NavigationContainer onStateChange={handleNav}><Stack /></NavigationContainer>
+      )
+    `)
+    assert.match(out, /__nohmoComposeState\(handleNav\)/, 'onStateChange was not composed')
+    assert.doesNotMatch(out, /__nohmoComposeReady|__nohmoMakeReady/,
+      'onReady was wired without a ref to read the route from')
+  })
+
+  test('running the plugin over its own output does not nest the wrappers', () => {
+    const once  = compile(`
+      export default () => (
+        <NavigationContainer ref={navRef} onStateChange={handleNav}><Stack /></NavigationContainer>
+      )
+    `)
+    const twice = compile(once)
+    assert.doesNotMatch(twice, /__nohmoComposeState\(__nohmoComposeState/,
+      'a second pass double-wrapped onStateChange')
+  })
+
+  // Matching the literal name `NavigationContainer` meant any app that spelled it
+  // differently got zero screen tracking and no signal that anything was wrong.
+  test('follows a renamed import', () => {
+    const out = compile(`
+      import { NavigationContainer as NavContainer } from '@react-navigation/native'
+      export default () => <NavContainer ref={navRef}><Stack /></NavContainer>
+    `)
+    assert.match(out, /__nohmoNavStateChange/, 'a renamed container was not instrumented')
+  })
+
+  test("instruments React Navigation 7's createStaticNavigation result", () => {
+    const out = compile(`
+      import { createStaticNavigation } from '@react-navigation/native'
+      const Navigation = createStaticNavigation(RootStack)
+      export default () => <Navigation ref={navRef} />
+    `)
+    assert.match(out, /__nohmoNavStateChange/, 'a static-API container was not instrumented')
+  })
+
+  test('static container declared after the JSX that uses it is still found', () => {
+    // The declaration is reached after the component body during traversal, so the
+    // names have to be collected up front rather than as they are encountered.
+    const out = compile(`
+      import { createStaticNavigation } from '@react-navigation/native'
+      export default function App() { return <Navigation ref={navRef} /> }
+      const Navigation = createStaticNavigation(RootStack)
+    `)
+    assert.match(out, /__nohmoNavStateChange/, 'declaration order changed the outcome')
+  })
+
+  test('an unrelated component named like a container is left alone', () => {
+    const out = compile(`
+      import { Navigation } from './my-ui-kit'
+      export default () => <Navigation ref={navRef} onPress={go} />
+    `)
+    assert.doesNotMatch(out, /__nohmoNavStateChange/,
+      'instrumented a component that is not a navigation container')
+  })
+
+  test('instrumented navigation output re-parses', () => {
+    const out = compile(`
+      export default () => (
+        <NavigationContainer ref={navRef} onStateChange={(s) => log(s)} onReady={boot}>
+          <Stack />
+        </NavigationContainer>
+      )
+    `)
+    assert.doesNotThrow(() => transformSync(out, {
+      filename: '/app/src/out.js', babelrc: false, configFile: false,
+      plugins: ['@babel/plugin-syntax-jsx'],
+    }), 'the plugin produced navigation code that will not parse')
+  })
 })
 
 describe('babel plugin — output is valid', () => {

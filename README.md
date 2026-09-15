@@ -220,7 +220,8 @@ If you skip `storage`, everything works — events are tracked, screens are reco
 
 ### Track screens automatically
 
-The Babel plugin handles this too — no prop changes needed. It detects `<NavigationContainer>` in your JSX and injects `onStateChange` and `onReady` at compile time:
+The Babel plugin handles this too. It finds your navigation container in your JSX and
+injects `onStateChange` and `onReady` at compile time:
 
 ```jsx
 // You write this (unchanged):
@@ -239,9 +240,73 @@ The Babel plugin handles this too — no prop changes needed. It detects `<Navig
 </NavigationContainer>
 ```
 
-Everything is driven by the single `plugins: ['nohmo/babel-plugin']` line in `babel.config.js`. No manual prop wiring.
+**If you already pass `onStateChange` or `onReady`, they are kept.** The plugin composes
+with your handler rather than replacing it — Nohmo's tracking runs first, then yours:
 
-**Manual tracking** — if you prefer per-screen control without the plugin:
+```jsx
+// You write:
+<NavigationContainer ref={navigationRef} onStateChange={handleNav}>
+
+// Compiles to — handleNav still runs, exactly as before:
+<NavigationContainer ref={navigationRef} onStateChange={__nohmoComposeState(handleNav)}>
+```
+
+> **Versions before 0.4.3 skipped injection when the prop was already set**, which meant
+> screen tracking silently did nothing: you got one `SCREEN_VIEW` at launch and never
+> another, every event was stamped with the launch screen, and `TIME_SPENT` never fired.
+> If you are on an older version, either upgrade or wire it manually (below).
+
+The plugin resolves the container from your import, so a renamed import and React
+Navigation 7's static API both work:
+
+```jsx
+import { NavigationContainer as NavContainer } from '@react-navigation/native'
+const Navigation = createStaticNavigation(RootStack)   // React Navigation 7
+```
+
+### When the plugin can't see your container
+
+It cannot instrument a container it never sees in your source. That means:
+
+- **Expo Router** — the container lives inside the `expo-router` package, not your code.
+- A container rendered by some other third-party package.
+- A project without `nohmo/babel-plugin` in `babel.config.js`.
+- **An app that doesn't use React Navigation at all** — your own state-based routing,
+  `react-native-navigation`, or anything else. There is no container to instrument, so
+  use `useScreenView` below.
+
+For any of these, wire it in one line. This always works, plugin or not:
+
+```tsx
+import { onNohmoStateChange } from 'nohmo/react-native/autocapture'
+
+<NavigationContainer ref={navigationRef} onStateChange={onNohmoStateChange}>
+  <RootNavigator />
+</NavigationContainer>
+```
+
+Already have your own handler? Call both:
+
+```tsx
+onStateChange={(state) => { onNohmoStateChange(state); handleNav(state) }}
+```
+
+To also capture the screen the app launches on, add `onReady`:
+
+```tsx
+import { onNohmoStateChange, makeNohmoReadyHandler } from 'nohmo/react-native/autocapture'
+
+<NavigationContainer
+  ref={navigationRef}
+  onStateChange={onNohmoStateChange}
+  onReady={makeNohmoReadyHandler(navigationRef)}
+>
+```
+
+### No React Navigation? Track screens per component
+
+This is the whole setup for an app that routes itself, and it works with no Babel plugin
+and no container:
 
 ```tsx
 import { useScreenView } from 'nohmo/react-native'
@@ -251,6 +316,32 @@ export default function HomeScreen() {
   return <View>…</View>
 }
 ```
+
+### How you'll know if screen tracking isn't working
+
+Screen tracking failing is invisible from the outside — events keep flowing, they are
+just all stamped with the screen the user started on. So the SDK checks its own event
+stream and warns you in development:
+
+```
+[Nohmo] Screen tracking does not look wired up.
+
+31 events this session but only 1 SCREEN_VIEW (Splash), so every event is being
+stamped with the launch screen and TIME_SPENT will never fire.
+```
+
+The warning names both fixes — the navigation one and `useScreenView` — because not every
+app has a navigator. It is development-only (`__DEV__`) and is stripped from release
+bundles.
+
+If your app genuinely has one screen, or you deliberately don't track screens, turn it off:
+
+```tsx
+<NohmoProvider projectId="…" apiKey="…" options={{ setupWarnings: false }}>
+```
+
+You can also check by eye: open **Live Feed** in the dashboard and navigate around your
+app. If the `Page` column never changes, screen tracking is not wired.
 
 ### Custom events
 
@@ -324,6 +415,7 @@ function PushTokenRegistrar() {
 | `debug` | `boolean` | `false` | Log all SDK activity to the console |
 | `autoAppLifecycle` | `boolean` | `true` | Auto-track `APP_OPEN` and `APP_BACKGROUND` on foreground/background transitions |
 | `autoErrors` | `boolean` | `true` | Capture JS errors (`JS_ERROR`) and crashes (`APP_CRASH`) — including native Android/iOS crashes |
+| `setupWarnings` | `boolean` | `true` | Development-only setup checks in the console (currently: screens never changing). Set `false` for a single-screen app, or one that deliberately does not track screens |
 | `host` | `string` | `https://www.nohmo.in` | Ingestion host. Only change this if you run a self-hosted Nohmo, or to point a test build at a local server. |
 | `storage` | `NohmoStorage` | in-memory | Provide an AsyncStorage-compatible object to persist device identity across app restarts. Pass `AsyncStorage` from `@react-native-async-storage/async-storage`. Without this, a new device ID is generated on every cold start. |
 

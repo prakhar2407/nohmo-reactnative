@@ -15,6 +15,12 @@ const PRESS_PROPS = new Set(['onPress', 'onLongPress'])
 const WRAP_ID = '__nohmoWrap'
 const NAV_STATE_ID = '__nohmoNavStateChange'
 const NAV_READY_ID = '__nohmoMakeReady'
+const NAV_COMPOSE_STATE_ID = '__nohmoComposeState'
+const NAV_COMPOSE_READY_ID = '__nohmoComposeReady'
+
+// Packages a navigation container can be imported from. `native` is the usual one;
+// `@react-navigation/core` re-exports the same component for custom setups.
+const NAV_PACKAGES = new Set(['@react-navigation/native', '@react-navigation/core'])
 const IMPORT_SOURCE = 'nohmo/react-native/autocapture'
 
 // Stop collecting after this many text fragments — keeps the injected
@@ -175,8 +181,54 @@ function iconNameFromChildren(children, t) {
 module.exports = function nohmoPlugin({ types: t }) {
   return {
     visitor: {
-      // Inject a single import statement at the top of any file we touched
       Program: {
+        /**
+         * Work out what this file actually calls its navigation container, before any
+         * JSX is visited.
+         *
+         * Matching the literal name `NavigationContainer` was too brittle: a renamed
+         * import (`NavigationContainer as NavContainer`) or React Navigation 7's
+         * `createStaticNavigation` both produce a container under a different name, and
+         * the plugin then instrumented nothing at all — silently, which is the failure
+         * mode that matters. Resolving the binding instead means we follow the import,
+         * not the spelling.
+         */
+        enter(programPath, state) {
+          // The bare name stays in the set so a container imported in some way we don't
+          // model — or re-exported through a local module — still matches as before.
+          state.nohmoContainers = new Set(['NavigationContainer'])
+          const staticFactories = new Set()
+
+          for (const node of programPath.node.body) {
+            if (!t.isImportDeclaration(node)) continue
+            if (!NAV_PACKAGES.has(node.source.value)) continue
+            for (const spec of node.specifiers) {
+              if (!t.isImportSpecifier(spec) || !t.isIdentifier(spec.imported)) continue
+              if (spec.imported.name === 'NavigationContainer') {
+                state.nohmoContainers.add(spec.local.name)
+              } else if (spec.imported.name === 'createStaticNavigation') {
+                staticFactories.add(spec.local.name)
+              }
+            }
+          }
+
+          // `const Navigation = createStaticNavigation(RootStack)` — the result takes the
+          // same ref/onStateChange/onReady props, so it is a container for our purposes.
+          // Collected up front rather than in a VariableDeclarator visitor, because the
+          // JSX that uses it can be traversed before the declaration is reached.
+          if (staticFactories.size > 0) {
+            programPath.traverse({
+              VariableDeclarator(declPath) {
+                const { id, init } = declPath.node
+                if (!t.isIdentifier(id) || !t.isCallExpression(init)) return
+                if (!t.isIdentifier(init.callee) || !staticFactories.has(init.callee.name)) return
+                state.nohmoContainers.add(id.name)
+              },
+            })
+          }
+        },
+
+        // Inject a single import statement at the top of any file we touched
         exit(programPath, state) {
           const specifiers = []
 
@@ -185,10 +237,26 @@ module.exports = function nohmoPlugin({ types: t }) {
               t.importSpecifier(t.identifier(WRAP_ID), t.identifier(WRAP_ID))
             )
           }
-          if (state.nohmoNavUsed) {
+          // Granular, so a file that only composes doesn't also import the two
+          // direct handlers it never references.
+          if (state.nohmoNavState) {
             specifiers.push(
-              t.importSpecifier(t.identifier(NAV_STATE_ID), t.identifier('onNohmoStateChange')),
+              t.importSpecifier(t.identifier(NAV_STATE_ID), t.identifier('onNohmoStateChange'))
+            )
+          }
+          if (state.nohmoNavReady) {
+            specifiers.push(
               t.importSpecifier(t.identifier(NAV_READY_ID), t.identifier('makeNohmoReadyHandler'))
+            )
+          }
+          if (state.nohmoNavComposeState) {
+            specifiers.push(
+              t.importSpecifier(t.identifier(NAV_COMPOSE_STATE_ID), t.identifier('composeNohmoStateChange'))
+            )
+          }
+          if (state.nohmoNavComposeReady) {
+            specifiers.push(
+              t.importSpecifier(t.identifier(NAV_COMPOSE_READY_ID), t.identifier('composeNohmoReady'))
             )
           }
 
@@ -209,47 +277,80 @@ module.exports = function nohmoPlugin({ types: t }) {
         const componentName = t.isJSXIdentifier(nameNode) ? nameNode.name : null
 
         // ── NavigationContainer: inject onStateChange + onReady ────────────
-        if (componentName === 'NavigationContainer') {
-          const existingPropNames = new Set(
-            attrs
-              .filter((a) => t.isJSXAttribute(a) && t.isJSXIdentifier(a.name))
-              .map((a) => a.name.name)
-          )
+        if (componentName && state.nohmoContainers && state.nohmoContainers.has(componentName)) {
+          const findAttr = (name) =>
+            attrs.find(
+              (a) => t.isJSXAttribute(a) && t.isJSXIdentifier(a.name) && a.name.name === name
+            )
 
-          // Inject onStateChange (skip if the user already set it)
-          if (!existingPropNames.has('onStateChange')) {
+          // Recognises our own output, so a second visit can't nest
+          // __nohmoComposeState(__nohmoComposeState(fn)).
+          const alreadyOurs = (expr) =>
+            t.isIdentifier(expr, { name: NAV_STATE_ID }) ||
+            (t.isCallExpression(expr) &&
+              t.isIdentifier(expr.callee) &&
+              [NAV_READY_ID, NAV_COMPOSE_STATE_ID, NAV_COMPOSE_READY_ID].includes(expr.callee.name))
+
+          // The navigationRef, needed to read the initial route in onReady. Only a plain
+          // Identifier (ref={navigationRef}) is usable — a callback or inline ref has no
+          // name the injected call could reference.
+          const refAttr = findAttr('ref')
+          const refExpr =
+            refAttr &&
+            t.isJSXExpressionContainer(refAttr.value) &&
+            t.isIdentifier(refAttr.value.expression)
+              ? refAttr.value.expression
+              : null
+
+          // ── onStateChange ──────────────────────────────────────────────────
+          // Absent: inject ours. Already set: COMPOSE with it. This used to bail, which
+          // was silent and total — the app kept the single SCREEN_VIEW that onReady
+          // captures at startup and never got another for the rest of the session. An
+          // app that passes its own onStateChange (its own analytics, a title sync) is
+          // common, so the bail hit exactly the apps already thinking about navigation.
+          const stateAttr = findAttr('onStateChange')
+          if (!stateAttr) {
             attrs.push(
               t.jsxAttribute(
                 t.jsxIdentifier('onStateChange'),
                 t.jsxExpressionContainer(t.identifier(NAV_STATE_ID))
               )
             )
-            state.nohmoNavUsed = true
+            state.nohmoNavState = true
+          } else if (t.isJSXExpressionContainer(stateAttr.value)) {
+            const userExpr = stateAttr.value.expression
+            if (t.isExpression(userExpr) && !alreadyOurs(userExpr)) {
+              stateAttr.value.expression = t.callExpression(
+                t.identifier(NAV_COMPOSE_STATE_ID),
+                [userExpr]
+              )
+              state.nohmoNavComposeState = true
+            }
           }
 
-          // Inject onReady using the ref prop value so we can capture the initial screen.
-          // Only inject when the ref is a simple Identifier (e.g. ref={navigationRef}).
-          // Deep-clone the node — reusing the same AST node in two positions causes
+          // ── onReady ────────────────────────────────────────────────────────
+          // Deep-clone the ref node — reusing the same AST node in two positions causes
           // malformed code generation on Hermes (ReferenceError: Property 'X' doesn't exist).
-          if (!existingPropNames.has('onReady')) {
-            const refAttr = attrs.find(
-              (a) =>
-                t.isJSXAttribute(a) &&
-                t.isJSXIdentifier(a.name) &&
-                a.name.name === 'ref'
-            )
-            if (refAttr && t.isJSXExpressionContainer(refAttr.value)) {
-              const refExpr = refAttr.value.expression
-              if (t.isIdentifier(refExpr)) {
-                attrs.push(
-                  t.jsxAttribute(
-                    t.jsxIdentifier('onReady'),
-                    t.jsxExpressionContainer(
-                      t.callExpression(t.identifier(NAV_READY_ID), [t.cloneNode(refExpr, true)])
-                    )
+          if (refExpr) {
+            const readyAttr = findAttr('onReady')
+            if (!readyAttr) {
+              attrs.push(
+                t.jsxAttribute(
+                  t.jsxIdentifier('onReady'),
+                  t.jsxExpressionContainer(
+                    t.callExpression(t.identifier(NAV_READY_ID), [t.cloneNode(refExpr, true)])
                   )
                 )
-                state.nohmoNavUsed = true
+              )
+              state.nohmoNavReady = true
+            } else if (t.isJSXExpressionContainer(readyAttr.value)) {
+              const userExpr = readyAttr.value.expression
+              if (t.isExpression(userExpr) && !alreadyOurs(userExpr)) {
+                readyAttr.value.expression = t.callExpression(
+                  t.identifier(NAV_COMPOSE_READY_ID),
+                  [userExpr, t.cloneNode(refExpr, true)]
+                )
+                state.nohmoNavComposeReady = true
               }
             }
           }

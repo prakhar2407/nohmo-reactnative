@@ -62,6 +62,11 @@ before(() => {
     module.exports = stub
   `)
 
+  // IS_DEV is captured at module scope, so __DEV__ must exist before the require.
+  // Safe for every other test: the wiring check also needs 30s of elapsed session,
+  // which no test reaches.
+  global.__DEV__ = true
+
   const req = createRequire(path.join(out, 'x.js'))
   NohmoRNTracker = req(compiled).NohmoRNTracker
   rn = req('react-native')
@@ -384,5 +389,114 @@ describe('React Native tracker — screens and lifecycle', () => {
     assert.ok(events.some(e => e.event === 'APP_BACKGROUND'))
     assert.notEqual(t.sessionId, first, 'returning did not mint a new session')
     assert.ok(events.filter(e => e.event === 'APP_OPEN').length >= 2)
+  })
+})
+
+/**
+ * The safety net for screen tracking, which is the one failure the SDK cannot see
+ * from the outside: events keep flowing, they are just all stamped with a screen the
+ * user left. This check is downstream of every cause — a container the Babel plugin
+ * could not instrument, Expo Router, createStaticNavigation, or nobody wiring it at
+ * all — so these tests pin the signal, not any particular cause.
+ */
+describe('React Native tracker — screen tracking wiring check', () => {
+  function captureWarn(fn) {
+    const seen = []
+    const orig = console.warn
+    console.warn = (...a) => seen.push(a.join(' '))
+    try { fn() } finally { console.warn = orig }
+    return seen
+  }
+
+  test('warns once when the app is busy but the screen never changes', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start()
+    // As if the session has been running a while — the check deliberately ignores a
+    // burst of taps on the launch screen in the first seconds.
+    t.startedAt = Date.now() - 60_000
+    t.screenViewCount = 1        // launch screen captured, nothing since
+    t.nonScreenEventCount = 0
+    t.navWiringChecked = false
+
+    const warnings = captureWarn(() => {
+      for (let i = 0; i < 15; i++) t.send('PRESS', { text: 'Next' })
+    })
+
+    assert.equal(warnings.length, 1, 'expected exactly one warning, not one per event')
+    assert.match(warnings[0], /Screen tracking does not look wired up/)
+    // The warning has to carry the fix, not just the complaint.
+    assert.match(warnings[0], /onNohmoStateChange/)
+  })
+
+  test('says nothing when screens are actually changing', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start()
+    t.startedAt = Date.now() - 60_000
+    t.screenViewCount = 0
+    t.nonScreenEventCount = 0
+    t.navWiringChecked = false
+
+    const warnings = captureWarn(() => {
+      t.trackScreenView('Home')
+      t.trackScreenView('Cart')
+      for (let i = 0; i < 15; i++) t.send('PRESS', { text: 'Next' })
+    })
+
+    assert.deepEqual(warnings, [], 'a correctly wired app was warned at')
+  })
+
+  test('the warning names a fix for apps that do not use React Navigation', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start()
+    t.startedAt = Date.now() - 60_000
+    t.screenViewCount = 0
+    t.nonScreenEventCount = 0
+    t.navWiringChecked = false
+
+    const warnings = captureWarn(() => {
+      for (let i = 0; i < 15; i++) t.send('PRESS', { text: 'Next' })
+    })
+
+    assert.equal(warnings.length, 1)
+    // Advice that only mentions NavigationContainer is useless to an app routing on
+    // its own state, so both paths have to be named.
+    assert.match(warnings[0], /useScreenView/, 'no fix offered for a non-navigator app')
+    assert.match(warnings[0], /setupWarnings: false/, 'no way to silence it was offered')
+  })
+
+  test('setupWarnings: false silences it for single-screen apps', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start({ setupWarnings: false })
+    t.startedAt = Date.now() - 60_000
+    t.screenViewCount = 1
+    t.nonScreenEventCount = 0
+    t.navWiringChecked = false
+
+    const warnings = captureWarn(() => {
+      for (let i = 0; i < 15; i++) t.send('PRESS', { text: 'Next' })
+    })
+
+    assert.deepEqual(warnings, [], 'an app that opted out was still warned at')
+  })
+
+  test('says nothing about a quiet session that simply has not navigated yet', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start()
+    t.startedAt = Date.now() - 60_000
+    t.screenViewCount = 1
+    t.nonScreenEventCount = 0
+    t.navWiringChecked = false
+
+    // Below NAV_CHECK_MIN_EVENTS — not enough activity to conclude anything.
+    const warnings = captureWarn(() => {
+      for (let i = 0; i < 5; i++) t.send('PRESS', { text: 'Next' })
+    })
+
+    assert.deepEqual(warnings, [], 'warned on too little evidence')
   })
 })

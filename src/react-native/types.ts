@@ -17,6 +17,15 @@ export interface NohmoRNConfig {
    * crashes). Set false to disable.
    */
   autoErrors?: boolean
+  /**
+   * Development-only setup checks. When true (the default) the SDK warns in the
+   * console if its own event stream says something is not wired up — currently, that
+   * screens are never changing. Stripped from release bundles either way.
+   *
+   * Set false for an app that genuinely has one screen, or one that deliberately does
+   * not track screens.
+   */
+  setupWarnings?: boolean
   storage?: NohmoStorage
   /**
    * Ingestion host. Only change this if you run a self-hosted Nohmo, or to
