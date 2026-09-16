@@ -393,6 +393,7 @@ quietly, so a call that looks like it worked really did:
 | `Server rejected the SDK credentials (HTTP 401)` | `projectId`/`apiKey` don't match a live key, or `host` points at the wrong server. Nothing is being recorded at all — check Dashboard → Settings → Setup. |
 | `the server does not know this device` | The initial `identify` never got through (usually offline on first launch). |
 | `linkUser failed: HTTP 4xx` | The call reached the server and was rejected — the status says why. |
+| `event delivery failed: HTTP 4xx` | A batch of events was refused. `/track` authenticates by body rather than header, so it can fail on its own. A 4xx is not retried — those events are gone — while a 5xx keeps them queued for the next flush. |
 
 A link that doesn't get through is not lost: the SDK records which userId the server
 actually confirmed and re-sends it on the next start, so someone who logged in while

@@ -704,3 +704,37 @@ describe('React Native tracker — a failed link is retried, not lost', () => {
       'every app open re-sent a link the server had already confirmed')
   })
 })
+
+describe('React Native tracker — a refused event batch is not dropped in silence', () => {
+  test('a 4xx on /track is reported', async () => {
+    rn.__reset()
+    mockFetch({ statusFor: (url) => (url.includes('/track/') ? 400 : 200) })
+
+    // /track authenticates by body rather than header, so it can be refused on its
+    // own while identify still succeeds. A 4xx there is not retried — the batch is
+    // gone — which makes saying so the only thing standing between the developer
+    // and an integration that records nothing and complains about nothing.
+    const errors = await captureErrors(async () => {
+      const { t } = await start()
+      await t._flush()
+    })
+
+    assert.ok(
+      errors.some((l) => l.includes('event delivery') && l.includes('400')),
+      `a refused event batch was dropped without a word: ${JSON.stringify(errors)}`,
+    )
+  })
+
+  test('a 5xx on /track still re-queues instead of reporting a drop', async () => {
+    rn.__reset()
+    const calls = mockFetch({ statusFor: (url) => (url.includes('/track/') ? 503 : 200) })
+    const { t } = await start()
+    await t._flush()
+
+    // The existing contract: the server never took the batch, so the events stay.
+    // Reporting must not have quietly changed that into a drop.
+    const before = calls.to('/track/').length
+    await t._flush()
+    assert.ok(calls.to('/track/').length > before, 'the batch was dropped instead of retried')
+  })
+})

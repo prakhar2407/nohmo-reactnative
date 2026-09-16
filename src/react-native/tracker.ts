@@ -956,8 +956,14 @@ export class NohmoRNTracker {
       // Previously any response at all — including a 502 from a proxy — was treated as
       // success and the batch was dropped.
       if (!res.ok && res.status >= 500) throw new Error(`HTTP ${res.status}`)
-      this._log(`Flushed ${batch.length} events`)
-      await this._persistQueue()   // delivered — drop them from durable storage too
+      // A 4xx is a different failure: retrying will not fix a rejected key or a
+      // malformed batch, so the batch is dropped rather than retried forever.
+      // Dropping it SILENTLY is how a whole integration goes quiet, though — and this
+      // is the endpoint that matters most, because it carries every event and
+      // authenticates by body rather than by header, so it can fail on its own while
+      // identify still succeeds.
+      if (this._resOk(res, 'event delivery')) this._log(`Flushed ${batch.length} events`)
+      await this._persistQueue()   // settled either way — drop them from durable storage
     } catch (err) {
       // Re-queue on failure, and persist so the retry survives the process ending.
       this.queue.unshift(...batch)
