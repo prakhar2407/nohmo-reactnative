@@ -84,7 +84,7 @@ function memStorage(seed = {}) {
 }
 
 /** Captures every request and lets a test choose the status per path. */
-function mockFetch({ status = 200, body = {} } = {}) {
+function mockFetch({ status = 200, body = {}, statusFor } = {}) {
   const calls = []
   global.fetch = async (url, init) => {
     const parsed = JSON.parse(init.body)
@@ -97,7 +97,10 @@ function mockFetch({ status = 200, body = {} } = {}) {
     } else if (String(url).includes('/attribute/')) {
       payload = { success: true, data: {} }
     }
-    return { ok: status < 400, status, json: async () => payload }
+    // A rejected call still answers with parseable JSON — that is exactly why
+    // ignoring the status looked like success for so long.
+    const st = statusFor?.(String(url)) ?? status
+    return { ok: st < 400, status: st, json: async () => payload }
   }
   calls.events = () => calls
     .filter(c => String(c.url).includes('/track/'))
@@ -498,5 +501,206 @@ describe('React Native tracker — screen tracking wiring check', () => {
     })
 
     assert.deepEqual(warnings, [], 'warned on too little evidence')
+  })
+})
+
+/** Runs `fn` with console.error captured, returning everything it logged. */
+async function captureErrors(fn) {
+  const original = console.error
+  const lines = []
+  console.error = (...args) => lines.push(args.join(' '))
+  try { await fn() } finally { console.error = original }
+  return lines
+}
+
+describe('React Native tracker — a rejected call is never reported as success', () => {
+  // All four of these were silent. The SDK read res.json() off every response and
+  // never looked at the status, so a 404 or a 401 logged success and carried on —
+  // the integration was doing nothing and saying nothing.
+
+  test('linkUser reports a rejected link instead of swallowing it', async () => {
+    rn.__reset()
+    mockFetch({ statusFor: (url) => (url.includes('/link-user/') ? 404 : 200) })
+    const { t } = await start()
+
+    const errors = await captureErrors(() => t.linkUser('user_42', 'a@b.com'))
+
+    assert.ok(errors.length > 0, 'a rejected linkUser logged nothing at all')
+    assert.ok(
+      errors.some((l) => l.includes('404') || l.toLowerCase().includes('does not know this device')),
+      `the error did not say what went wrong: ${JSON.stringify(errors)}`,
+    )
+  })
+
+  test('a rejected linkUser does not emit USER_LINKED', async () => {
+    rn.__reset()
+    const calls = mockFetch({ statusFor: (url) => (url.includes('/link-user/') ? 404 : 200) })
+    const { t } = await start()
+
+    await captureErrors(() => t.linkUser('user_42'))
+    await t._flush()
+
+    // USER_LINKED is what the dashboard counts as "this device has a user", so
+    // emitting it for a link the server refused reports a user who is not linked.
+    assert.ok(
+      !calls.events().some((e) => e.event === 'USER_LINKED'),
+      'USER_LINKED was sent for a link the server rejected',
+    )
+  })
+
+  test('an accepted linkUser still emits USER_LINKED', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+
+    await t.linkUser('user_42', 'a@b.com')
+    await t._flush()
+
+    const linked = calls.events().find((e) => e.event === 'USER_LINKED')
+    assert.ok(linked, 'the happy path stopped emitting USER_LINKED')
+    assert.equal(linked.data.userId, 'user_42')
+    assert.equal(calls.to('/link-user/').length, 1)
+    assert.equal(calls.to('/link-user/')[0].body.userId, 'user_42')
+  })
+
+  test('rejected credentials are reported once, naming the fix', async () => {
+    rn.__reset()
+    mockFetch({ status: 401 })
+
+    const errors = await captureErrors(async () => {
+      const { t } = await start()
+      await t.linkUser('user_42')
+      await t.registerPushToken('tok')
+    })
+
+    const credential = errors.filter((l) => l.includes('rejected the SDK credentials'))
+    assert.equal(credential.length, 1, `expected exactly one credentials error, got ${credential.length}`)
+    // The message has to be actionable: three calls failing with "HTTP 401" tells
+    // nobody which of projectId, apiKey or host is wrong.
+    assert.ok(credential[0].includes('apiKey') && credential[0].includes('projectId'))
+  })
+})
+
+describe('React Native tracker — identity survives a reinstall', () => {
+  // An uninstall wipes AsyncStorage, so the device id the SDK generated is gone.
+  // The backend can only recognise the returning phone by `stableId`, which React
+  // Native never sent — every reinstall became a new anonymous device.
+
+  test('identify carries the native stable id', async () => {
+    rn.__reset()
+    rn.NativeModules.NohmoStableId = { getStableId: async () => 'stable-abc' }
+    const calls = mockFetch()
+    await start()
+
+    assert.equal(calls.to('/identify/')[0].body.stableId, 'stable-abc')
+  })
+
+  test('the same phone reports the same stable id across a reinstall', async () => {
+    rn.__reset()
+    rn.NativeModules.NohmoStableId = { getStableId: async () => 'stable-abc' }
+
+    const calls = mockFetch()
+    await start({}, memStorage())            // first install
+    await start({}, memStorage())            // uninstall wipes storage, then reinstall
+
+    const [first, second] = calls.to('/identify/')
+    assert.notEqual(first.body.deviceId, second.body.deviceId, 'storage was not actually cleared')
+    // Asserted present before being compared — two missing values are equal too,
+    // which is exactly the broken state this test exists to catch.
+    assert.equal(first.body.stableId, 'stable-abc', 'the first install sent no stable id')
+    assert.equal(second.body.stableId, 'stable-abc',
+      'the reinstall reported a different stable id, so the backend cannot match it')
+  })
+
+  test('a reinstall adopts the device id the backend matched it to', async () => {
+    rn.__reset()
+    rn.NativeModules.NohmoStableId = { getStableId: async () => 'stable-abc' }
+
+    // What the server does with a known stableId: hand back the ORIGINAL device
+    // id so the returning phone resumes its own history instead of starting over.
+    const seen = []
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(init.body)
+      seen.push({ url: String(url), body })
+      if (String(url).includes('/identify/')) {
+        return { ok: true, status: 200,
+          json: async () => ({ success: true, data: { deviceId: 'did_original', userId: 'user_7' } }) }
+      }
+      return { ok: true, status: 200, json: async () => ({ success: true, data: {} }) }
+    }
+
+    const storage = memStorage()
+    const { t } = await start({}, storage)
+    await t._flush()
+
+    assert.equal(storage.store['@nohmo_did'], 'did_original',
+      'the canonical device id was not persisted, so the next launch starts over again')
+    const events = seen.filter((c) => c.url.includes('/track/')).flatMap((c) => c.body.events)
+    assert.ok(events.length > 0)
+    for (const e of events) {
+      assert.equal(e.deviceId, 'did_original', `${e.event} was still sent under the throwaway id`)
+    }
+  })
+
+  test('no stable id is sent when the native module is missing', async () => {
+    rn.__reset()                              // Expo Go, or a build from before this shipped
+    const calls = mockFetch()
+    await start()
+
+    // Absent, not empty: the backend treats '' as "no stable id", but sending the
+    // key at all would have it match every other device that sent ''.
+    assert.ok(!('stableId' in calls.to('/identify/')[0].body))
+  })
+
+  test('a native module that never answers does not hang startup', async () => {
+    rn.__reset()
+    rn.NativeModules.NohmoStableId = { getStableId: () => new Promise(() => {}) }
+    const calls = mockFetch()
+
+    // init() awaits the stable id, so an unresolved Keychain read would otherwise
+    // mean an app that never finishes starting.
+    await start()
+
+    assert.equal(calls.to('/identify/').length, 1, 'init never reached identify')
+    assert.ok(!('stableId' in calls.to('/identify/')[0].body))
+  })
+})
+
+describe('React Native tracker — a failed link is retried, not lost', () => {
+  test('a link the server refused is re-sent on the next start', async () => {
+    rn.__reset()
+    const storage = memStorage()
+
+    // Login while the link endpoint is down.
+    mockFetch({ statusFor: (url) => (url.includes('/link-user/') ? 503 : 200) })
+    const { t } = await start({}, storage)
+    await captureErrors(() => t.linkUser('user_42'))
+    assert.equal(storage.store['@nohmo_linked_uid'], undefined,
+      'a refused link was recorded as confirmed')
+
+    // Next app start, endpoint healthy. Nothing in the app calls linkUser again —
+    // without the retry the user stays anonymous until they log in a second time.
+    const calls = mockFetch()
+    await start({}, storage)
+
+    const links = calls.to('/link-user/')
+    assert.equal(links.length, 1, 'the unconfirmed link was not retried on startup')
+    assert.equal(links[0].body.userId, 'user_42')
+    assert.equal(storage.store['@nohmo_linked_uid'], 'user_42')
+  })
+
+  test('a confirmed link costs no request on later starts', async () => {
+    rn.__reset()
+    const storage = memStorage()
+
+    mockFetch()
+    const { t } = await start({}, storage)
+    await t.linkUser('user_42')
+
+    // Reopening the app is the common case by far, so it must not re-link.
+    const calls = mockFetch()
+    await start({}, storage)
+    assert.equal(calls.to('/link-user/').length, 0,
+      'every app open re-sent a link the server had already confirmed')
   })
 })

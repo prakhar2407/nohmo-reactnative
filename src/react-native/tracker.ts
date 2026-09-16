@@ -28,6 +28,11 @@ const _p = {
 const KEYS = {
   deviceId:     '@nohmo_did',
   userId:       '@nohmo_uid',
+  // The userId the SERVER confirmed, which is not the same thing as the one the
+  // app asked for. A link that failed (offline at login, or a device identify had
+  // not registered yet) used to be lost for good: nothing retried it, so the user
+  // stayed anonymous in the dashboard until they happened to log in again.
+  linkedUserId: '@nohmo_linked_uid',
   firstOpen:    '@nohmo_first',
   installAttr:  '@nohmo_install_attr',
   deepLink:     '@nohmo_deeplink',
@@ -150,6 +155,12 @@ export class NohmoRNTracker {
   private pendingEvents: PartialEvent[] = []
   private flushTimer: ReturnType<typeof setInterval> | null = null
   private appStateSubscription: ReturnType<typeof AppState.addEventListener> | null = null
+  // Set once the server has rejected our credentials, so the (identical) error is
+  // reported once instead of on every call.
+  private credentialsRejected = false
+  // True once identify has been accepted, so link-user can tell "wrong userId"
+  // from "this device was never registered".
+  private deviceRegistered = false
   private initResolve: () => void = () => {}
   private readonly initPromise: Promise<void>
   private initStarted = false
@@ -211,7 +222,7 @@ export class NohmoRNTracker {
     this.initStarted = true
     try {
       // Read persisted IDs
-      const [storedDeviceId, storedUserId, firstOpenDone, initialUrl, storedInstallAttr, storedCrash, storedQueue] = await Promise.all([
+      const [storedDeviceId, storedUserId, firstOpenDone, initialUrl, storedInstallAttr, storedCrash, storedQueue, storedLinkedUserId] = await Promise.all([
         this.storage.getItem(KEYS.deviceId),
         this.storage.getItem(KEYS.userId),
         this.storage.getItem(KEYS.firstOpen),
@@ -219,6 +230,7 @@ export class NohmoRNTracker {
         this.storage.getItem(KEYS.installAttr),
         this.storage.getItem(KEYS.pendingCrash),
         this.storage.getItem(KEYS.queue),
+        this.storage.getItem(KEYS.linkedUserId),
       ])
 
       // Events that outlived a previous process. Restored first so they keep their
@@ -255,6 +267,10 @@ export class NohmoRNTracker {
       let deviceId = storedDeviceId ?? genId('did')
       if (!storedDeviceId) await this.storage.setItem(KEYS.deviceId, deviceId)
 
+      // Reinstall-durable identity. Read every launch rather than cached in our
+      // own storage, because our storage is the thing an uninstall wipes.
+      const stableId = await this._readStableId()
+
       this.userId = storedUserId ?? null
 
       // Identify with backend
@@ -265,6 +281,12 @@ export class NohmoRNTracker {
           headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
           body: JSON.stringify({
             deviceId,
+            // The backend reconciles a returning device on this and nothing else.
+            // It was never sent from React Native, so a reinstall — which wipes the
+            // deviceId above — always looked like a device the project had never
+            // seen: a second install, a new anonymous user, and a logged-in user
+            // silently detached from their history.
+            ...(stableId ? { stableId } : {}),
             knownUserId: this.userId ?? undefined,
             platform: Platform.OS,
             appVersion: this.config.appVersion,
@@ -289,16 +311,29 @@ export class NohmoRNTracker {
             },
           }),
         })
-        const json = await res.json() as { success: boolean; data?: { deviceId?: string; userId?: string } }
-        const data = json.data ?? {}
-        deviceId = data.deviceId ?? deviceId
-        if (data.userId) this.userId = data.userId
-      } catch {
-        // fallback to local deviceId
+        // A failed identify is the one that hurts most: the server never creates
+        // the Device row, so every later call for this device (link-user,
+        // push-token, attribute) answers 404 no matter how correct it is.
+        if (this._resOk(res, 'identify')) {
+          const json = await res.json() as { success: boolean; data?: { deviceId?: string; userId?: string } }
+          const data = json.data ?? {}
+          deviceId = data.deviceId ?? deviceId
+          if (data.userId) this.userId = data.userId
+          this.deviceRegistered = true
+        }
+      } catch (err) {
+        // Offline or DNS failure — keep the local deviceId and let the queue retry.
+        this._log('identify failed, using local device id:', err)
       }
 
       this.deviceId = deviceId
       await this.storage.setItem(KEYS.deviceId, deviceId)
+
+      // Re-send a link the server never confirmed. Only when the two disagree, so
+      // the steady state (logged-in user reopening the app) costs no request.
+      if (this.deviceRegistered && this.userId && storedLinkedUserId !== this.userId) {
+        await this._sendLinkUser(this.userId)
+      }
 
       // Drain buffered pre-init events
       for (const e of this.pendingEvents) {
@@ -475,6 +510,7 @@ export class NohmoRNTracker {
           content: this.userId || '',
         }),
       })
+      if (!this._resOk(res, 'buildInviteLink')) return this._fullInviteLink(opts)
       const data = await res.json()
       if (data && data.shortCode) {
         const url = `${this.config.host}/api/l/${data.shortCode}/`
@@ -507,9 +543,19 @@ export class NohmoRNTracker {
     this.userId = userId
     await this.storage.setItem(KEYS.userId, userId)
     this._flush()
+    await this._sendLinkUser(userId, email, meta)
+  }
 
+  /**
+   * The link-user request itself.
+   *
+   * Separate from linkUser() because init() retries an unconfirmed link, and
+   * linkUser() awaits initPromise — calling it from inside init would wait on a
+   * promise only init itself can resolve.
+   */
+  private async _sendLinkUser(userId: string, email?: string, meta?: Record<string, unknown>): Promise<void> {
     try {
-      await fetch(`${this.config.host}${_p.l}`, {
+      const res = await fetch(`${this.config.host}${_p.l}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({
@@ -519,6 +565,21 @@ export class NohmoRNTracker {
           meta: meta ?? {},
         }),
       })
+      if (!this._resOk(res, 'linkUser')) {
+        // 404 here means identify never registered this device, so say that
+        // outright — "linkUser failed: HTTP 404" on its own sends people looking
+        // at the wrong call.
+        if (res.status === 404 && !this.deviceRegistered) {
+          console.error(
+            `[Nohmo RN] linkUser: the server does not know this device, because ` +
+            `identify never completed. The userId was saved locally and will be ` +
+            `sent on the next successful start.`
+          )
+        }
+        return
+      }
+      // Only now is the link real, so only now does the retry stop.
+      await this.storage.setItem(KEYS.linkedUserId, userId)
       this.send('USER_LINKED', { userId, email })
       this._log('User linked:', userId)
     } catch (err) {
@@ -566,6 +627,7 @@ export class NohmoRNTracker {
           platform: Platform.OS,
         }),
       })
+      if (!this._resOk(res, 'install attribution')) return
       const dlv = (await res.json())?.data?.deepLinkValue
       if (dlv && !this.deepLink) this._resolveDeepLink(dlv, 'deferred')
     } catch { /* non-critical */ }
@@ -614,6 +676,31 @@ export class NohmoRNTracker {
     if (v) this._resolveDeepLink(v, 'direct')
   }
 
+  /**
+   * The device's reinstall-durable id, or '' when there isn't one.
+   *
+   * iOS keeps a random UUID in the Keychain, Android hashes ANDROID_ID — both
+   * outlive the app container that AsyncStorage lives in. Absent in Expo Go and
+   * in any build made before this module shipped, where '' restores exactly the
+   * old per-install behaviour.
+   */
+  private async _readStableId(): Promise<string> {
+    try {
+      const mod = NativeModules.NohmoStableId
+      if (!mod?.getStableId) return ''
+      // Keychain reads can block on a locked device. init() awaits this before it
+      // can identify, so cap the wait rather than risk a launch that never
+      // finishes starting up.
+      const value = await Promise.race([
+        mod.getStableId() as Promise<string>,
+        new Promise<string>((resolve) => setTimeout(() => resolve(''), 2000)),
+      ])
+      return typeof value === 'string' ? value : ''
+    } catch {
+      return ''   // native module absent — fall back to per-install identity
+    }
+  }
+
   private async _autoReadInstallReferrer(): Promise<void> {
     // Android: Play Store preserves the referrer query string set by ClickView.
     // iOS: pasteboard token written by the Nohmo click-link interstitial page.
@@ -644,6 +731,7 @@ export class NohmoRNTracker {
           platform: Platform.OS,
         }),
       })
+      if (!this._resOk(res, 'install attribution')) return
       // A probabilistic match can still carry a deferred deep-link destination.
       const dlv = (await res.json())?.data?.deepLinkValue
       if (dlv && !this.deepLink) this._resolveDeepLink(dlv, 'deferred')
@@ -654,11 +742,12 @@ export class NohmoRNTracker {
     await this.initPromise
     if (!token || !this.deviceId) return
     try {
-      await fetch(`${this.config.host}${_p.pt}`, {
+      const res = await fetch(`${this.config.host}${_p.pt}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.config.apiKey },
         body: JSON.stringify({ deviceId: this.deviceId, pushToken: token }),
       })
+      if (!this._resOk(res, 'registerPushToken')) return
       this._log('Push token registered')
     } catch (err) {
       this._log('registerPushToken failed:', err)
@@ -928,6 +1017,44 @@ export class NohmoRNTracker {
 
   private _log(...args: unknown[]) {
     if (this.config.debug) console.log('[Nohmo RN]', ...args)
+  }
+
+  /**
+   * Did the server actually accept this call?
+   *
+   * Every endpoint below used to read `res.json()` straight off the response and
+   * never look at the status. A rejected API key, a project id that doesn't
+   * exist, or a device the server has never heard of all came back 4xx with a
+   * perfectly parseable JSON body — so the SDK took the miss for a hit, logged
+   * success and moved on. Nothing in the app, the console or the dashboard said
+   * otherwise, which is the worst way for an analytics SDK to fail.
+   *
+   * Logged at error level rather than through _log, because someone whose
+   * integration is silently dropping everything is exactly the person who has
+   * not turned `debug` on.
+   */
+  private _resOk(res: { ok: boolean; status: number }, what: string): boolean {
+    if (res.ok) return true
+
+    // 401/403 means the credentials are wrong, so EVERY call will fail the same
+    // way — one clear message beats the same line repeated per event.
+    if (res.status === 401 || res.status === 403) {
+      if (!this.credentialsRejected) {
+        this.credentialsRejected = true
+        console.error(
+          `[Nohmo RN] Server rejected the SDK credentials (HTTP ${res.status}).\n\n` +
+          `Nothing will be recorded until this is fixed — no installs, no screens, ` +
+          `no linkUser.\n\n` +
+          `Check that projectId and apiKey on <NohmoProvider> match a live key in ` +
+          `Dashboard \u2192 Settings \u2192 Setup, and that host (${this.config.host}) ` +
+          `is the right server.`
+        )
+      }
+      return false
+    }
+
+    console.error(`[Nohmo RN] ${what} failed: HTTP ${res.status}`)
+    return false
   }
 
   destroy() {

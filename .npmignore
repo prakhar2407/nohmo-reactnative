@@ -8,11 +8,13 @@ node_modules/
 .git/
 *.log
 
-# Gradle leaves its build cache inside android/ — lock files, checksum
-# databases and executionHistory blobs. package.json's `files` allowlist pulls
-# in `android`, which swept all of that into the published tarball (11 files of
-# pure machine-local state, including .lock files that mean nothing on anyone
-# else's disk).
+# Gradle leaves its build cache inside android/ — lock files, checksum databases
+# and compiled .class files. These patterns do NOT hold on their own: when
+# package.json has a `files` allowlist, naming a directory in it wins over an
+# ignore rule for a path inside that directory, so `android` in `files` shipped
+# android/build/ regardless of what was written here. The allowlist now names
+# `android/build.gradle` and `android/src` instead, which is what actually keeps
+# build output out of the tarball. Kept as defence in depth.
 android/.gradle/
 android/build/
 android/local.properties

@@ -10,6 +10,7 @@ class NohmoPackage : ReactPackage {
         listOf(
             NohmoInstallReferrerModule(reactContext),
             NohmoCrashModule(reactContext),
+            NohmoStableIdModule(reactContext),
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =

@@ -33,7 +33,8 @@
   "files": [
     "dist",
     "react-native",
-    "android",
+    "android/build.gradle",
+    "android/src",
     "ios",
     "Nohmo.podspec",
     "react-native.config.cjs",

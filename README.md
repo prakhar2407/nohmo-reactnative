@@ -206,6 +206,29 @@ export default function App() {
 
 If you skip `storage`, everything works — events are tracked, screens are recorded, users can be identified — you just won't get returning-device recognition after an app kill.
 
+### Surviving a reinstall
+
+AsyncStorage lives inside the app container, which both platforms delete when the app
+is uninstalled. On its own that means a reinstall looks like a device Nohmo has never
+seen: the install is counted again, and a user who had logged in comes back anonymous.
+
+To close that gap the SDK reads a reinstall-durable id from a bundled native module and
+sends it as `stableId`, which is what the backend matches a returning device on:
+
+| Platform | Source | Resets when |
+|----------|--------|-------------|
+| iOS | A random UUID in the Keychain, `ThisDeviceOnly` so it never syncs to another device via iCloud | The device is erased |
+| Android | SHA-256 of `ANDROID_ID` salted with your package name — no raw hardware id leaves the device | Factory reset |
+
+Nothing to install or configure: the module ships with the package and is picked up by
+autolinking. It does need a **native build**, so run `pod install` (iOS) or let Gradle
+sync (Android) after upgrading — `npx expo prebuild` if you're on Expo.
+
+> **Expo Go** cannot load custom native modules, so there is no stable id there and a
+> reinstall starts a new device, exactly as before. Use a development build to get it.
+> The SDK degrades quietly: it sends no `stableId` rather than a guessed one, because a
+> guessed value would collide across identical phones and merge two people into one.
+
 ### What gets tracked automatically
 
 | Event | Trigger |
@@ -360,6 +383,21 @@ const { linkUser } = useNohmo()
 // After login
 await linkUser(user.id, user.email, { plan: user.plan })
 ```
+
+`linkUser` is safe to call before the SDK has finished starting up — it waits, then
+sends. If the server refuses the link it says so on the console rather than resolving
+quietly, so a call that looks like it worked really did:
+
+| Console message | Cause |
+|-----------------|-------|
+| `Server rejected the SDK credentials (HTTP 401)` | `projectId`/`apiKey` don't match a live key, or `host` points at the wrong server. Nothing is being recorded at all — check Dashboard → Settings → Setup. |
+| `the server does not know this device` | The initial `identify` never got through (usually offline on first launch). |
+| `linkUser failed: HTTP 4xx` | The call reached the server and was rejected — the status says why. |
+
+A link that doesn't get through is not lost: the SDK records which userId the server
+actually confirmed and re-sends it on the next start, so someone who logged in while
+offline is linked as soon as the app next reaches the network. A link already confirmed
+costs no request on later launches.
 
 ### Track conversions
 
