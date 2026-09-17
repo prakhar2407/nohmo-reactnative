@@ -26,6 +26,14 @@ export interface NohmoRNConfig {
    * not track screens.
    */
   setupWarnings?: boolean
+  /**
+   * How long the app may be in the background before returning counts as a new
+   * session, in milliseconds. Default 30 minutes, matching the Flutter SDK.
+   *
+   * Below it, coming back resumes the same session and the time away is not
+   * counted as time in the app — a glance at an OTP should not end a visit.
+   */
+  sessionTimeout?: number
   storage?: NohmoStorage
   /**
    * Ingestion host. Only change this if you run a self-hosted Nohmo, or to
@@ -46,7 +54,6 @@ export interface NohmoRNEvent {
   platform: 'ios' | 'android'
   appVersion: string
   utm?: Record<string, string>
-  install_utm?: Record<string, string>
   /** Which client library produced this — 'react-native' here. Distinct from platform:
    *  a Flutter app reports platform 'android' too, and without this the server cannot
    *  tell which SDK sent a malformed payload. Cannot be backfilled later. */

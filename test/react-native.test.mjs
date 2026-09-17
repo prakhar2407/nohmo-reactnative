@@ -57,6 +57,7 @@ before(() => {
       __initialUrl: null,
       __appState: (s) => appStateHandler && appStateHandler(s),
       __openUrl: (url) => urlHandler && urlHandler({ url }),
+      __hasAppStateHandler: () => appStateHandler !== null,
       __reset: () => { stub.__initialUrl = null; stub.NativeModules = {} },
     }
     module.exports = stub
@@ -199,6 +200,31 @@ describe('React Native tracker — attribution', () => {
     assert.equal(e.utm.campaign, 'x')
   })
 
+  test('install attribution does not ride on every other event', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+    await t.setInstallReferrer('utm_source=google-play&utm_medium=organic')
+    t.trackScreenView('/cart')
+    t.send('ADD_TO_CART')
+    await t._flush()
+
+    // The attribution itself is still reported, as its own event.
+    const attributed = calls.events().find(e => e.event === 'INSTALL_ATTRIBUTED')
+    assert.ok(attributed, 'no INSTALL_ATTRIBUTED')
+
+    // But it used to be stamped onto every event for the life of the install —
+    // roughly 88 bytes on every SCREEN_VIEW, PRESS and CONVERSION — and
+    // ingestion never read the field. It is not referenced anywhere in the
+    // backend or the dashboard, and is not even stored, because only `data` is
+    // persisted as JSON. The attribution is already durable server-side in
+    // InstallAttribution, keyed to the device.
+    for (const e of calls.events()) {
+      assert.equal(e.install_utm, undefined,
+        `${e.event} still carries a field nothing reads`)
+    }
+  })
+
   test('INSTALL_ATTRIBUTED keeps the raw utm_* names', async () => {
     rn.__reset()
     const calls = mockFetch()
@@ -331,7 +357,7 @@ describe('React Native tracker — screens and lifecycle', () => {
     const calls = mockFetch()
     const { t } = await start()
     t.trackScreenView('Home')
-    t.sessionStart = Date.now() - 4000        // stand in for four seconds on Home
+    t.screenStart = Date.now() - 4000         // stand in for four seconds on Home
     t.trackScreenView('Cart')
     await t._flush()
 
@@ -378,19 +404,23 @@ describe('React Native tracker — screens and lifecycle', () => {
     assert.equal(calls.events().filter(e => e.event === 'APP_BACKGROUND').length, 0)
   })
 
-  test('backgrounding then returning starts a new session', async () => {
+  test('coming back after a long absence starts a new session', async () => {
+    // A genuine return — the app was away longer than sessionTimeout. Anything
+    // shorter resumes instead, which the 'a moment in another app' test covers;
+    // this one guards the other side of that line.
     rn.__reset()
     const calls = mockFetch()
-    const { t } = await start()
+    const { t } = await start({ sessionTimeout: 50 })
     const first = t.sessionId
     t.sessionStart = Date.now() - 3000
     rn.__appState('background')
+    await new Promise((r) => setTimeout(r, 90))     // longer than sessionTimeout
     rn.__appState('active')
     await t._flush()
 
     const events = calls.events()
     assert.ok(events.some(e => e.event === 'APP_BACKGROUND'))
-    assert.notEqual(t.sessionId, first, 'returning did not mint a new session')
+    assert.notEqual(t.sessionId, first, 'a real return did not mint a new session')
     assert.ok(events.filter(e => e.event === 'APP_OPEN').length >= 2)
   })
 })
@@ -736,5 +766,250 @@ describe('React Native tracker — a refused event batch is not dropped in silen
     const before = calls.to('/track/').length
     await t._flush()
     assert.ok(calls.to('/track/').length > before, 'the batch was dropped instead of retried')
+  })
+})
+
+describe('React Native tracker — lifecycle under a remount', () => {
+  // React StrictMode mounts, unmounts and remounts every effect in development,
+  // and NohmoProvider builds a tracker in that effect. init() is async, so the
+  // first tracker is destroyed while its identify is still in flight and then
+  // carries on setting up timers, listeners and events for a tracker nobody
+  // holds. Everything here is what that produces on a phone.
+
+  test('a tracker destroyed mid-init leaves no flush timer behind', async () => {
+    rn.__reset()
+    mockFetch()
+    const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: memStorage() })
+    trackers.push(t)
+    const initing = t.init()
+    t.destroy()               // the StrictMode cleanup, before init resolves
+    await initing
+
+    // A live interval here fires for the life of the app, on a tracker that was
+    // thrown away — and it is invisible, because the events go nowhere useful.
+    assert.equal(t.flushTimer, null, 'init() armed a flush timer after destroy()')
+  })
+
+  test('a tracker destroyed mid-init attaches no listeners', async () => {
+    rn.__reset()
+    mockFetch()
+    const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: memStorage() })
+    trackers.push(t)
+    const initing = t.init()
+    t.destroy()
+    await initing
+
+    assert.equal(t.appStateSubscription, null,
+      'an AppState listener was attached after destroy() — a dead tracker still reacts to backgrounding')
+  })
+
+  test('a destroyed tracker sends nothing more', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+    await t._flush()
+    const before = calls.to('/track/').length
+
+    t.destroy()
+    t.send('after_destroy', {})
+    await t._flush()
+
+    const sentAfter = calls.to('/track/').slice(before)
+      .flatMap((c) => c.body.events).filter((e) => e.event === 'after_destroy')
+    assert.equal(sentAfter.length, 0, 'a destroyed tracker still delivered an event')
+  })
+
+  test('a double mount reports one install, not two', async () => {
+    // APP_INSTALL is the headline mobile metric. The guard against duplicates is
+    // per-tracker (initStarted), but a remount builds a SECOND tracker, so both
+    // read the first-open flag as unset and both report an install.
+    rn.__reset()
+    const calls = mockFetch()
+    const storage = memStorage()
+
+    const first = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage })
+    trackers.push(first)
+    const firstInit = first.init()
+    first.destroy()
+    const second = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage })
+    trackers.push(second)
+    await Promise.all([firstInit, second.init()])
+    await second._flush()
+
+    const installs = calls.events().filter((e) => e.event === 'APP_INSTALL')
+    assert.equal(installs.length, 1, `expected one APP_INSTALL across the remount, got ${installs.length}`)
+  })
+})
+
+describe('React Native tracker — storage that fails', () => {
+  test('a storage backend that throws does not stop the SDK', async () => {
+    // A host app can hand us any NohmoStorage. Secure storage on a locked device,
+    // a full disk, or a hot-reloaded native module all reject — and analytics must
+    // not take the app down with it.
+    rn.__reset()
+    mockFetch()
+    const hostile = {
+      getItem: async () => { throw new Error('storage unavailable') },
+      setItem: async () => { throw new Error('storage unavailable') },
+    }
+    const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: hostile })
+    trackers.push(t)
+
+    await assert.doesNotReject(() => t.init(), 'init() rejected when storage threw')
+    assert.doesNotThrow(() => t.send('still_works', {}))
+    await assert.doesNotReject(() => t._flush())
+  })
+
+  test('events still reach the server when storage is unusable', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const hostile = {
+      getItem: async () => { throw new Error('nope') },
+      setItem: async () => { throw new Error('nope') },
+    }
+    const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: hostile })
+    trackers.push(t)
+    await t.init()
+    t.send('purchase', { amount: 99 })
+    await t._flush()
+
+    assert.ok(calls.events().some((e) => e.event === 'purchase'),
+      'nothing was delivered — a device with unusable storage reports no analytics at all')
+  })
+})
+
+describe('React Native tracker — a dead tracker stays dead', () => {
+  test('backgrounding after destroy reports nothing', async () => {
+    // AppState fires app-wide. A tracker that did not release its subscription
+    // keeps reporting sessions for a screen nobody is on.
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+    await t._flush()
+    const before = calls.events().length
+
+    t.destroy()
+    rn.__appState('background')
+    rn.__appState('active')
+    await new Promise((r) => setTimeout(r, 30))
+
+    const after = calls.events().slice(before).map((e) => e.event)
+    assert.deepEqual(after.filter((e) => e === 'APP_BACKGROUND' || e === 'APP_OPEN'), [],
+      `a destroyed tracker still reported ${after.join(', ')}`)
+  })
+
+  test('a deep link after destroy notifies nobody', async () => {
+    rn.__reset()
+    mockFetch()
+    const { t } = await start()
+    const seen = []
+    t.onDeepLink((v) => seen.push(v))
+    t.destroy()
+    rn.__openUrl('myapp://open?nohmo_dl=/promo')
+    await new Promise((r) => setTimeout(r, 30))
+    assert.deepEqual(seen, [], 'a destroyed tracker still delivered a deep link')
+  })
+
+  test('three remounts do not stack app-state listeners', async () => {
+    // Each mount must leave the app exactly as it found it, or a screen that
+    // remounts often turns one backgrounding into many reports.
+    rn.__reset()
+    mockFetch()
+    for (let i = 0; i < 3; i++) {
+      const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: memStorage() })
+      trackers.push(t)
+      await t.init()
+      t.destroy()
+    }
+    // The stub keeps a single handler slot and clears it on remove(); anything
+    // left attached means a subscription outlived its tracker.
+    assert.equal(rn.__hasAppStateHandler(), false, 'an AppState listener outlived its tracker')
+  })
+})
+
+describe('React Native tracker — identity before init finishes', () => {
+  test('linkUser called immediately still links', async () => {
+    // Child effects run before the provider's, so an app that links on mount
+    // calls this before the tracker has a deviceId. It has to wait, not drop.
+    rn.__reset()
+    const calls = mockFetch()
+    const t = new NohmoRNTracker({ projectId: 'proj_t', apiKey: 'pk_t', host: HOST, storage: memStorage() })
+    trackers.push(t)
+    const linking = t.linkUser('user_early', 'a@b.com')   // before init()
+    await t.init()
+    await linking
+    await t._flush()
+
+    const links = calls.to('/link-user/')
+    assert.equal(links.length, 1, 'the early linkUser never reached the server')
+    assert.equal(links[0].body.userId, 'user_early')
+    assert.ok(links[0].body.deviceId, 'linkUser went out without a deviceId')
+  })
+})
+
+describe('React Native tracker — session and screen clocks', () => {
+  // Both of these are already right in the Flutter SDK, whose comments say what
+  // they cost when they are wrong. The React Native tracker never got them.
+
+  test('session duration is the whole session, not the last screen', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+
+    // A ten-minute session: the user has been in the app a while.
+    t.sessionStart = Date.now() - 600_000
+    t.currentScreen = 'Home'
+    t.trackScreenView('Checkout')      // a normal navigation, moments ago
+    rn.__appState('background')
+    await new Promise((r) => setTimeout(r, 20))
+    await t._flush()
+
+    const bg = calls.events().find((e) => e.event === 'APP_BACKGROUND')
+    assert.ok(bg, 'no APP_BACKGROUND was reported')
+    assert.ok(bg.data.sessionDurationSecs > 500,
+      `session reported as ${bg.data.sessionDurationSecs}s — the screen change reset the session clock, so Avg. Session Time is measuring the last screen`)
+  })
+
+  test('a moment in another app resumes the session, it does not start one', async () => {
+    // Reading an OTP, approving a payment, picking a photo. Minting a session for
+    // each splits one real journey into several and inflates the session count.
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+    await t._flush()
+    const sessionBefore = t.sessionId
+
+    rn.__appState('background')
+    await new Promise((r) => setTimeout(r, 30))
+    rn.__appState('active')
+    await new Promise((r) => setTimeout(r, 20))
+    await t._flush()
+
+    assert.equal(t.sessionId, sessionBefore,
+      'a few seconds away started a brand-new session')
+    const opens = calls.events().filter((e) => e.event === 'APP_OPEN')
+    assert.equal(opens.length, 1, `expected the launch APP_OPEN only, got ${opens.length}`)
+  })
+
+  test('time spent in the background is not billed to the screen', async () => {
+    rn.__reset()
+    const calls = mockFetch()
+    const { t } = await start()
+    t.trackScreenView('Home')
+    await t._flush()
+
+    rn.__appState('background')
+    // Simulate a long lunch break while backgrounded.
+    t.sessionStart = Date.now() - 3_600_000
+    rn.__appState('active')
+    t.trackScreenView('Profile')
+    await new Promise((r) => setTimeout(r, 20))
+    await t._flush()
+
+    const spent = calls.events().filter((e) => e.event === 'TIME_SPENT' && e.data.screen === 'Home')
+    for (const e of spent) {
+      assert.ok(e.data.seconds < 120,
+        `Home was credited with ${e.data.seconds}s — the user's time in another app was billed to the screen they left open`)
+    }
   })
 })

@@ -1,0 +1,6 @@
+{
+  "name": "nohmo-react-native-entry",
+  "private": true,
+  "main": "index.js",
+  "types": "../dist/react-native.d.ts"
+}

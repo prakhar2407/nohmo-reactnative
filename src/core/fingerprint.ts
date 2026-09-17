@@ -1,3 +1,4 @@
+import { readStore, writeStore } from './storage'
 let cachedDeviceId: string | null = null
 let cachedStableId: string | null = null
 let cachedDeviceInfo: DeviceInfo | null = null
@@ -95,14 +96,14 @@ async function hash(input: string): Promise<string> {
 export async function getStableId(): Promise<string> {
   if (cachedStableId) return cachedStableId
 
-  const stored = localStorage.getItem('_nohmo_sid')
+  const stored = readStore('local', '_nohmo_sid')
   if (stored) {
     cachedStableId = stored
     return stored
   }
 
   const id = await hash(stableSignals())
-  localStorage.setItem('_nohmo_sid', id)
+  writeStore('local', '_nohmo_sid', id)
   cachedStableId = id
   return id
 }
@@ -110,7 +111,7 @@ export async function getStableId(): Promise<string> {
 export function getDeviceId(): string {
   if (cachedDeviceId) return cachedDeviceId
 
-  const stored = localStorage.getItem('_nohmo_did')
+  const stored = readStore('local', '_nohmo_did')
   if (stored) {
     cachedDeviceId = stored
     return stored
@@ -118,7 +119,7 @@ export function getDeviceId(): string {
 
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   const id = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
-  localStorage.setItem('_nohmo_did', id)
+  writeStore('local', '_nohmo_did', id)
   cachedDeviceId = id
   return id
 }

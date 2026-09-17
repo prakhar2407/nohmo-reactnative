@@ -2,18 +2,46 @@
 
 Official analytics SDK for [Nohmo](https://www.nohmo.in) — device tracking, session journeys, UTM attribution, and real-time event streaming for React, Next.js, React Native, Flutter, and plain HTML / Django templates.
 
+## Before you start
+
+You need two values from your Nohmo dashboard. Everything below uses them.
+
+1. Sign in at [nohmo.in](https://www.nohmo.in) and create a project.
+2. Open **Settings → Setup**. It shows your **Project ID** (`proj_…`) and **API key** (`pk_…`).
+
+Both are safe to ship in a browser bundle or a mobile app — they only allow writing
+events to your project, never reading your data.
+
+> Throughout this README, `proj_xxxx` and `pk_xxxx` are placeholders. Replace them with
+> your own two values.
+
 ## Install
 
+One package covers web, React Native and Node. Install it once:
+
 ```bash
-# Web (React / Next.js)
 npm install nohmo
+```
 
-# React Native (iOS & Android)
-npm install nohmo
+React Native only — recommended, so a device keeps its identity across app restarts:
 
-# Optional — recommended for persisting device identity across app restarts
+```bash
 npm install @react-native-async-storage/async-storage
 ```
+
+Flutter is a separate package; see [Flutter](#flutter-ios--android) below.
+
+## Which guide do I follow?
+
+| You are instrumenting | Go to |
+|-----------------------|-------|
+| A Next.js, React, or plain-HTML site | [Quick start](#quick-start), just below |
+| A React Native / Expo app | [React Native](#react-native-ios--android) |
+| A Flutter app | [Flutter](#flutter-ios--android) |
+| A Node/Express backend | [Node backend errors](#node-backend-errors-nohmoserver) |
+| A Django/Flask/FastAPI backend | [the Python package](https://www.nohmo.in/docs/python) |
+
+You can use several together — one project collects web, app and backend in one place.
 
 ## Quick start
 
@@ -79,7 +107,12 @@ function App() {
 }
 ```
 
-No automatic route-change tracking — use `usePageView('/path')` in each page component or call `send('PAGE_VIEW', …)` manually on route changes.
+Route changes are tracked automatically — the provider watches the History API, which
+every client-side router goes through, so React Router, Wouter, TanStack Router and
+hand-rolled routing all work with no per-page code. Back/forward and redirects
+(`replaceState`) are included.
+
+Set `autoPageView: false` in `options` to turn it off and send page views yourself.
 
 ### Plain HTML / Django templates (no build step)
 
@@ -118,6 +151,20 @@ That's it. Page views, clicks, scroll depth, time spent, and rage-clicks are tra
 `window.nohmo` is available as soon as the script finishes loading (`defer` guarantees it runs after the DOM is ready). For inline scripts that run before the page finishes loading, use `window.addEventListener('load', () => { window.nohmo.send(...) })`.
 
 ---
+
+## Check it worked
+
+Run your app and click around for a few seconds, then open **Live Feed** in the
+dashboard. Events show up within a few seconds of arriving.
+
+Nothing there? The SDK reports failures on the console rather than going quiet — look for
+a line starting `[Nohmo]`:
+
+| Console message | What it means |
+|-----------------|---------------|
+| `Server rejected the SDK credentials (HTTP 401)` | `projectId` or `apiKey` is wrong. Copy both again from **Settings → Setup**. |
+| `event delivery failed: HTTP 4xx` | Events reached the server and were refused; the status says why. |
+| *nothing at all* | The SDK never started — check the provider actually wraps your app. |
 
 ## Track custom events
 
@@ -160,20 +207,36 @@ Once a user is linked, their identity persists. If they visit from a different d
 
 ## Manual page view hook
 
+You should not need this — the provider tracks route changes on its own. It is here for
+the cases it cannot see: a screen that changes without touching the URL (a wizard step, a
+tab, a modal treated as a page), or a path you want reported differently from
+`location.pathname`.
+
 ```tsx
 import { usePageView } from 'nohmo'
 
-export default function MyPage() {
-  usePageView('/my-page') // fires PAGE_VIEW once on mount
+export default function CheckoutStep2() {
+  usePageView('/checkout/shipping') // a step that has no URL of its own
   return <div>…</div>
 }
 ```
+
+Upgrading from a version without automatic tracking? You can leave your existing
+`usePageView()` calls where they are. Both paths go through the same tracker, which
+ignores a repeat of the same path within half a second — so a screen reported twice is
+still counted once. Remove them at your leisure, or pass `autoPageView: false` to keep
+doing it all by hand.
 
 ---
 
 ## React Native (iOS & Android)
 
 Nohmo includes a first-party React Native SDK under `nohmo/react-native`. One package, two platforms.
+
+> **Finding the mobile settings.** The dashboard has a **Web / App** switch next to your
+> project name in the top bar. App stores, Deep linking, Nohmo Links and Uninstalls only
+> appear in **Settings** while you are on the **App** side — if a tab named below is not
+> there, flip that switch first.
 
 ### Setup
 
@@ -236,6 +299,16 @@ sync (Android) after upgrading — `npx expo prebuild` if you're on Expo.
 | `APP_INSTALL` | First time the app ever opens |
 | `APP_OPEN` | Every time the app becomes active |
 | `APP_BACKGROUND` | When the app goes to background, with session duration |
+
+**How a session is measured.** It starts on launch and ends when the app has been in
+the background longer than `sessionTimeout`. Coming back sooner resumes the same
+session, and the time spent away is not counted towards it — so `APP_BACKGROUND`'s
+`sessionDurationSecs` is time actually spent *in* the app, across every screen the
+user visited.
+
+`TIME_SPENT` is a separate, per-screen measure. The two used to share one clock, which
+meant a ten-minute session in which the user changed screens was reported as however
+long the last screen happened to be open.
 | `TIME_SPENT` | When leaving a screen or backgrounding the app, with seconds on the screen |
 | `JS_ERROR` | A non-fatal JS error caught by the global handler, with message + stack |
 | `APP_CRASH` | A fatal JS crash — persisted and reported on the next app launch, attributed to the session it happened in |
@@ -413,7 +486,7 @@ trackConversion('purchase', { amount: 29.99, currency: 'USD' })
 
 Nohmo detects app uninstalls using the same silent-push technique used by AppsFlyer and Adjust.
 
-**1. Upload your Firebase Service Account JSON** in **Settings → App** in your Nohmo dashboard.
+**1. Upload your Firebase Service Account JSON** in **Settings → Uninstalls** in your Nohmo dashboard.
 
 **2. Install Firebase Messaging:**
 ```bash
@@ -441,7 +514,7 @@ function PushTokenRegistrar() {
 - Every night at **03:00 UTC**, Nohmo sends a silent data-only FCM message to every device that hasn't opened the app in 24h
 - If FCM returns `NotRegistered` → app was uninstalled → device is marked automatically
 - No code needed after the one-time setup
-- Results in **App Analytics → Uninstalls** with daily chart, uninstall rate, and D1/D7/D30 retention
+- Results in the **Dashboard** (App surface) with daily chart, uninstall rate, and D1/D7/D30 retention
 
 **Accuracy:** ~85–90% — users with push notifications disabled cannot be detected (same limitation as every major analytics SDK).
 
@@ -450,11 +523,12 @@ function PushTokenRegistrar() {
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `appVersion` | `string` | `''` | App version string sent with every event |
-| `flushInterval` | `number` | `5000` | Milliseconds between batch event flushes |
+| `flushInterval` | `number` | `5000` (ms) | How long a partial batch waits before being sent. **Milliseconds**, unlike the Node SDK, which takes seconds. |
 | `debug` | `boolean` | `false` | Log all SDK activity to the console |
 | `autoAppLifecycle` | `boolean` | `true` | Auto-track `APP_OPEN` and `APP_BACKGROUND` on foreground/background transitions |
 | `autoErrors` | `boolean` | `true` | Capture JS errors (`JS_ERROR`) and crashes (`APP_CRASH`) — including native Android/iOS crashes |
 | `setupWarnings` | `boolean` | `true` | Development-only setup checks in the console (currently: screens never changing). Set `false` for a single-screen app, or one that deliberately does not track screens |
+| `sessionTimeout` | `number` | `1800000` (30 min) | How long the app may sit in the background before returning counts as a new session. Below it, coming back resumes the same session and the time away is not counted as time in the app — a glance at an OTP should not end a visit. |
 | `host` | `string` | `https://www.nohmo.in` | Ingestion host. Only change this if you run a self-hosted Nohmo, or to point a test build at a local server. |
 | `storage` | `NohmoStorage` | in-memory | Provide an AsyncStorage-compatible object to persist device identity across app restarts. Pass `AsyncStorage` from `@react-native-async-storage/async-storage`. Without this, a new device ID is generated on every cold start. |
 
@@ -506,7 +580,7 @@ Nohmo uses the same deterministic attribution mechanism as AppsFlyer and Adjust.
 
 **How it works end-to-end:**
 
-1. **Build a tracking link** in **Settings → App → Attribution Link Builder** in your Nohmo dashboard. Fill in your UTM fields and copy the generated link:
+1. **Build a tracking link** in **Settings → Nohmo Links** in your Nohmo dashboard. Fill in your UTM fields and copy the generated link:
    ```
    https://www.nohmo.in/api/click/<project-code>/?utm_source=facebook&utm_medium=cpc&utm_campaign=summer
    ```
@@ -518,7 +592,7 @@ Nohmo uses the same deterministic attribution mechanism as AppsFlyer and Adjust.
 
 3. **No extra setup needed.** Attribution is built into the Nohmo SDK — the SDK reads the Play Store referrer (Android) or system pasteboard (iOS) automatically on first open and sends it to the backend for matching. **Zero code needed in your app.**
 
-4. **Results appear** in **App Analytics → Install Attribution** with a breakdown by source, campaign, and match type.
+4. **Results appear** in **Attribution** with a breakdown by source, campaign, and match type.
 
 **Attribution priority:**
 
@@ -541,7 +615,7 @@ Pass UTM params in your deep link URL and the SDK captures them automatically:
 yourapp://open?utm_source=meta&utm_medium=cpc&utm_campaign=summer
 ```
 
-Attribution appears in **Traffic → Conversions** and is linked to every event in that session.
+Attribution appears in **Conversions** and is linked to every event in that session.
 
 ### Smart Links — deep linking & deferred deep linking (OneLink-style)
 
@@ -571,12 +645,12 @@ function useSmartLinkRouting(navigation) {
 `getDeepLink()` returns the current destination synchronously if you'd rather poll.
 
 Create Smart Links (and set the **Destination**) in the dashboard under
-**Settings → Mobile → Smart Links**. Deferred deep linking works out of the box.
+**Settings → Nohmo Links**. Deferred deep linking works out of the box.
 To make an **installed** app open directly, do the one-time setup below.
 
 #### One-time setup for direct open (Universal / App Links)
 
-**1. Dashboard** — fill in your app identity under **Settings → Mobile → Deep linking**:
+**1. Dashboard** — fill in your app identity under **Settings → Deep linking**:
 your iOS App ID (`TEAMID.bundle.id`), Android package, and SHA-256 signing fingerprint(s).
 Nohmo then publishes the association files automatically:
 
@@ -630,7 +704,7 @@ function InviteButton() {
 - **Returns a short URL** (`/api/l/<code>`). The same user + options always resolves to the same code, and it's cached, so repeated shares never create duplicate links. Offline, it falls back to the full click URL.
 - **Options:** `channel` → `utm_medium` (e.g. `'whatsapp'`), `campaign` → `utm_campaign`, `source` → `utm_source` (defaults to `'referral'`).
 
-When the invitee installs through the link, their device's attribution shows the sharer's id — **deterministic on Android** (Play Install Referrer), **best-effort on iOS** (pasteboard when they tap through the click interstitial, probabilistic otherwise). Requires your **iOS App Store URL** to be set in **Settings → App**. Results appear in **App Analytics → Install Attribution** and on each device's **Came from** card.
+When the invitee installs through the link, their device's attribution shows the sharer's id — **deterministic on Android** (Play Install Referrer), **best-effort on iOS** (pasteboard when they tap through the click interstitial, probabilistic otherwise). Requires your **iOS App Store URL** to be set in **Settings → App stores**. Results appear in **Attribution** and on each device's **Came from** card.
 
 ---
 
@@ -645,7 +719,7 @@ published to pub.dev as [`nohmo`](https://pub.dev/packages/nohmo).
 ```yaml
 # pubspec.yaml
 dependencies:
-  nohmo: ^0.4.1
+  nohmo: ^0.5.0
 ```
 
 ```dart
@@ -715,7 +789,7 @@ trackConversion('money_deposit', { amount: 500, currency: 'USD' })
 </script>
 ```
 
-### 3. See results in Traffic → Conversions
+### 3. See results on the Conversions page
 
 The **Traffic** page has a **Conversions** tab showing total conversions broken down by UTM source, medium, campaign, and custom attribution parameters. Filter by a specific goal to drill into which channels drive that conversion type.
 
@@ -727,7 +801,7 @@ Attribution is automatic — if the user arrived via `?utm_source=google&utm_med
 
 | Event | Trigger | Data |
 |-------|---------|------|
-| `PAGE_VIEW` | Every route change (Next.js) or `usePageView()` | `page`, `referrer` |
+| `PAGE_VIEW` | Every route change, in any React app | `page`, `referrer` |
 | `TIME_SPENT` | When navigating away from a page | `seconds` |
 | `SCROLL_DEPTH` | At 25 / 50 / 75 / 100% scroll milestones | `depth` |
 | `CLICK` | Click on any interactive element | `tag`, `text`, `href` |
@@ -894,7 +968,7 @@ await flush(5000)   // resolves false if anything was dropped — worth checking
 | `dedupWindow` | `5` | Seconds before an identical error is sent again |
 | `queueSize` | `1000` | Bounded — drops rather than growing without limit |
 | `batchSize` | `50` | Events per request |
-| `flushInterval` | `5` | Seconds before a partial batch ships |
+| `flushInterval` | `5` (seconds) | How long a partial batch waits before being sent. **Seconds**, unlike the browser and React Native SDKs, which take milliseconds. |
 | `sendDefaultPii` | `false` | Include headers, query strings and user email |
 | `debug` | `false` | Verbose logging |
 
@@ -943,7 +1017,7 @@ Parameters are stored in `sessionStorage` so they persist across SPA navigations
 
 Not everyone uses full UTM strings. Nohmo lets you define short custom parameter names (e.g. `?ref=`, `?from=`, `?via=`) that are treated as attribution when no standard `utm_*` params are present.
 
-**Configure in the dashboard** — go to **Settings → General → Attribution parameters** and add the parameter names you want to track. Changes take effect on the next page load; no code change or SDK rebuild needed.
+**Configure in the dashboard** — go to **Settings → Domains** and add the parameter names you want to track. Changes take effect on the next page load; no code change or SDK rebuild needed.
 
 ```
 # Examples of URLs that will be attributed automatically
@@ -962,7 +1036,7 @@ The SDK fetches your configured list from the backend when it initialises, so th
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `flushInterval` | `number` | `3000` | Milliseconds between batch event flushes |
+| `flushInterval` | `number` | `3000` (ms) | How long a partial batch waits before being sent. **Milliseconds**, unlike the Node SDK, which takes seconds. |
 | `debug` | `boolean` | `false` | Log all events and state to the browser console |
 | `autoPageView` | `boolean` | `true` | Send `PAGE_VIEW` on every route change (Next.js only) |
 | `autoScrollDepth` | `boolean` | `true` | Track scroll depth at 25 / 50 / 75 / 100% |
@@ -997,8 +1071,8 @@ The SDK fetches your configured list from the backend when it initialises, so th
 | **Live feed** | Real-time event stream via WebSocket — see who is on your site right now |
 | **Events** | GA4-style top actions ranked by count / users / per-user, an activity breakdown by event type, and a live recent-activity feed |
 | **Journeys** | Page flows (which path users take from page to page) plus entry & exit pages with bounce and exit rates |
-| **Traffic → Attribution** | Session breakdown by UTM source, medium, campaign, and custom attribution params |
-| **Traffic → Conversions** | Conversion counts by goal, source, medium, campaign — shows which ads drove results |
+| **Attribution** | Session breakdown by UTM source, medium, campaign, and custom attribution params |
+| **Conversions** | Conversion counts by goal, source, medium, campaign — shows which ads drove results |
 | **App analytics** | Installs, DAU/MAU, D1/D7/D30 retention, uninstalls & uninstall rate, reinstalls, crashes, platform split, app versions, top screens, and install attribution |
 | **Settings → Webhooks** | Friction triggers — fire an HMAC-signed HTTP webhook in real time on rage clicks, a friction-score threshold, or a matched event |
 

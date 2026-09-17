@@ -1,67 +1,36 @@
 'use client'
 
-import React, { useEffect, useRef, useState } from 'react'
-import { NohmoProvider, useNohmo } from '../react/NohmoProvider'
-import { currentPath, onRouteChange } from '../core/route'
+import React from 'react'
+import { NohmoProvider } from '../react/NohmoProvider'
 import type { NohmoConfig } from '../core/types'
 
 /**
- * Route tracking for App Router apps.
+ * Next.js entry point.
  *
- * This used to read `usePathname` from 'next/navigation'. It no longer does — that static
- * import sat in the main bundle and made `import 'nohmo'` fail in any app that is not a
- * Next app, which is every Vite and CRA project. The History-based watcher in core/route
- * covers App Router soft navigation identically, and works everywhere else too.
+ * Kept as its own export because it is what the Next docs tell people to import,
+ * but there is nothing Next-specific left in it. Route tracking used to live
+ * here, in a child component that watched the History API; it now lives in
+ * NohmoProvider, which means every React app gets it rather than only Next ones.
+ *
+ * Moving it also fixed two things that were invisible from the outside: the
+ * child's first PAGE_VIEW was dropped (its effect ran before the provider had
+ * built the tracker), and route changes went through send() rather than
+ * trackPageView(), so the page clock was never restarted and every TIME_SPENT
+ * after the first navigation measured the whole visit.
  */
-function NohmoNextInner() {
-  const { trackTimeSpent, send } = useNohmo()
-  const [pathname, setPathname] = useState<string>(() => currentPath())
-  const isFirst = useRef(true)
-  const prevPath = useRef<string>(pathname)
-
-  useEffect(() => onRouteChange(setPathname), [])
-
-  useEffect(() => {
-    if (isFirst.current) {
-      isFirst.current = false
-      send('PAGE_VIEW', {
-        path: pathname,
-        title: typeof document !== 'undefined' ? document.title : '',
-      })
-      return
-    }
-
-    trackTimeSpent(prevPath.current)
-    send('PAGE_VIEW', {
-      path: pathname,
-      title: typeof document !== 'undefined' ? document.title : '',
-    })
-    prevPath.current = pathname
-  }, [pathname])
-
-  return null
-}
-
-interface NohmoNextProviderProps {
-  children: React.ReactNode
-  projectId: string
-  apiKey: string
-  options?: Partial<NohmoConfig>
-}
-
 export function NohmoNextProvider({
   children,
   projectId,
   apiKey,
   options = {},
-}: NohmoNextProviderProps) {
+}: {
+  children: React.ReactNode
+  projectId: string
+  apiKey: string
+  options?: Partial<NohmoConfig>
+}) {
   return (
-    <NohmoProvider
-      projectId={projectId}
-      apiKey={apiKey}
-      options={options}
-    >
-      <NohmoNextInner />
+    <NohmoProvider projectId={projectId} apiKey={apiKey} options={options}>
       {children}
     </NohmoProvider>
   )

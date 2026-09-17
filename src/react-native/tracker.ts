@@ -7,6 +7,30 @@ const SDK_NAME = 'react-native'
 const SDK_VERSION = '__NOHMO_VERSION__'
 
 
+/**
+ * Wrap a host-supplied storage so it can never throw or reject.
+ *
+ * The storage is whatever the app passes in — AsyncStorage, secure storage, MMKV,
+ * a test double. Any of them can fail: a locked device, a full disk, a native
+ * module still reloading. init() reads six keys in one Promise.all, so a single
+ * rejection aborted the whole thing before a deviceId existed, and every event
+ * from then on sat in the pre-init buffer and was never delivered. The device
+ * reported no analytics at all, silently.
+ *
+ * Degrading to "no stored value" costs identity across restarts and keeps
+ * everything else working, which is the right way round.
+ */
+function safeStorage(inner: NohmoStorage): NohmoStorage {
+  return {
+    async getItem(key) {
+      try { return await inner.getItem(key) } catch { return null }
+    },
+    async setItem(key, value) {
+      try { await inner.setItem(key, value) } catch { /* nothing worth breaking for */ }
+    },
+  }
+}
+
 function makeMemoryStorage(): NohmoStorage {
   const store: Record<string, string> = {}
   return {
@@ -34,7 +58,6 @@ const KEYS = {
   // stayed anonymous in the dashboard until they happened to log in again.
   linkedUserId: '@nohmo_linked_uid',
   firstOpen:    '@nohmo_first',
-  installAttr:  '@nohmo_install_attr',
   deepLink:     '@nohmo_deeplink',
   pendingCrash: '@nohmo_pending_crash',
   // Undelivered events, so a batch survives the process being killed. Without this the
@@ -71,9 +94,9 @@ function genId(prefix: string) {
 
 /**
  * Attribution exactly as it appeared in the URL — `utm_source`, `ref`, … — with
- * no renaming. This shape is what the INSTALL_ATTRIBUTED event body and
- * `install_utm` carry, because the dashboard's journey view renders that event
- * by reading `data.utm_source` directly.
+ * no renaming. This shape is what the INSTALL_ATTRIBUTED event body carries,
+ * because the dashboard's journey view renders that event by reading
+ * `data.utm_source` directly.
  */
 function parseRawUtmParams(url: string | null): Record<string, string> {
   if (!url) return {}
@@ -150,7 +173,18 @@ export class NohmoRNTracker {
   private userId: string | null = null
   private sessionId: string
   private currentScreen = ''
+  /**
+   * Separate clocks on purpose: TIME_SPENT is per screen, APP_BACKGROUND's
+   * duration is per session. They shared one start time, which trackScreenView
+   * reset on every navigation — so a ten-minute session in which the user moved
+   * screens reported as however long the last screen happened to be open, and
+   * Avg. Session Time measured the final screen instead of the visit. The
+   * Flutter SDK was fixed for this; this one was not.
+   */
+  private screenStart = Date.now()
   private sessionStart = Date.now()
+  /** When the app went to background, for deciding resume vs new session. */
+  private backgroundedAt = 0
   private queue: NohmoRNEvent[] = []
   private pendingEvents: PartialEvent[] = []
   private flushTimer: ReturnType<typeof setInterval> | null = null
@@ -164,9 +198,16 @@ export class NohmoRNTracker {
   private initResolve: () => void = () => {}
   private readonly initPromise: Promise<void>
   private initStarted = false
+  /**
+   * Set by destroy(). init() is async, so a provider remount — which React
+   * StrictMode performs on every mount in development — destroys the first
+   * tracker while its identify is still in flight. Without this it went on to
+   * arm a flush interval, attach an AppState listener and queue events, all on
+   * a tracker nobody holds any more.
+   */
+  private destroyed = false
   private persistTimer: ReturnType<typeof setTimeout> | null = null
   private deepLinkUtm: Record<string, string> = {}
-  private installAttr: Record<string, string> = {}
   private installAttrAttempted = false
   // Distinct from installAttrAttempted: that one is set even when the auto-read
   // found nothing, to stop the empty probabilistic ping repeating. This one only
@@ -197,12 +238,13 @@ export class NohmoRNTracker {
       autoAppLifecycle: true,
       autoErrors: true,
       setupWarnings: true,
+      sessionTimeout: 30 * 60 * 1000,
       appVersion: '',
       storage: makeMemoryStorage(),
       host: DEFAULT_HOST,
       ...config,
     }
-    this.storage = this.config.storage
+    this.storage = safeStorage(this.config.storage)
     this.sessionId = genId('sess')
     this.initPromise = new Promise(r => { this.initResolve = r })
   }
@@ -222,12 +264,11 @@ export class NohmoRNTracker {
     this.initStarted = true
     try {
       // Read persisted IDs
-      const [storedDeviceId, storedUserId, firstOpenDone, initialUrl, storedInstallAttr, storedCrash, storedQueue, storedLinkedUserId] = await Promise.all([
+      const [storedDeviceId, storedUserId, firstOpenDone, initialUrl, storedCrash, storedQueue, storedLinkedUserId] = await Promise.all([
         this.storage.getItem(KEYS.deviceId),
         this.storage.getItem(KEYS.userId),
         this.storage.getItem(KEYS.firstOpen),
         Linking.getInitialURL(),
-        this.storage.getItem(KEYS.installAttr),
         this.storage.getItem(KEYS.pendingCrash),
         this.storage.getItem(KEYS.queue),
         this.storage.getItem(KEYS.linkedUserId),
@@ -259,10 +300,6 @@ export class NohmoRNTracker {
         const v = parseDeepLinkValue(url)
         if (v) this._resolveDeepLink(v, 'direct')
       })
-      if (storedInstallAttr) {
-        try { this.installAttr = JSON.parse(storedInstallAttr) } catch { /* ignore */ }
-      }
-
       // Device ID — generate once, persist forever
       let deviceId = storedDeviceId ?? genId('did')
       if (!storedDeviceId) await this.storage.setItem(KEYS.deviceId, deviceId)
@@ -401,6 +438,15 @@ export class NohmoRNTracker {
         appVersion: this.config.appVersion,
       })
 
+      // Destroyed while identify was in flight. Everything from here on attaches
+      // something to the app — an AppState listener, the global error handler,
+      // native crash handlers, a flush interval — and there is nobody left to
+      // take them off again.
+      if (this.destroyed) {
+        this.initResolve()
+        return
+      }
+
       // App lifecycle
       if (this.config.autoAppLifecycle) {
         this.appStateSubscription = AppState.addEventListener('change', this._onAppStateChange)
@@ -432,6 +478,7 @@ export class NohmoRNTracker {
   }
 
   send(event: string, data: Record<string, unknown> = {}) {
+    if (this.destroyed) return
     // Counted before the pre-init buffering branch below: this measures what the app
     // produced, not what was delivered.
     if (event === 'SCREEN_VIEW') this.screenViewCount++
@@ -449,7 +496,6 @@ export class NohmoRNTracker {
       platform: Platform.OS as 'ios' | 'android',
       appVersion: this.config.appVersion,
       ...(Object.keys(this.deepLinkUtm).length > 0 ? { utm: this.deepLinkUtm } : {}),
-      ...(Object.keys(this.installAttr).length > 0 ? { install_utm: this.installAttr } : {}),
     }
 
     if (!this.deviceId) {
@@ -466,13 +512,13 @@ export class NohmoRNTracker {
   trackScreenView(screenName: string) {
     const prev = this.currentScreen
     if (prev && prev !== screenName) {
-      const secs = Math.round((Date.now() - this.sessionStart) / 1000)
+      const secs = Math.round((Date.now() - this.screenStart) / 1000)
       if (secs > 0) {
         this.send('TIME_SPENT', { screen: prev, seconds: secs })
       }
     }
     this.currentScreen = screenName
-    this.sessionStart = Date.now()
+    this.screenStart = Date.now()
     this._syncCrashContext()
     this.send('SCREEN_VIEW', { screen: screenName })
   }
@@ -604,12 +650,9 @@ export class NohmoRNTracker {
     this.installAttrAttempted = true
 
     // Raw `utm_*` names here, not the normalised ones: this map becomes the
-    // INSTALL_ATTRIBUTED body and `install_utm`, and the dashboard reads
-    // `data.utm_source` off it.
+    // INSTALL_ATTRIBUTED body, and the dashboard reads `data.utm_source` off it.
     const parsed = parseRawUtmParams('?' + referrerString)
     if (Object.keys(parsed).length > 0) {
-      this.installAttr = parsed
-      await this.storage.setItem(KEYS.installAttr, JSON.stringify(parsed))
       this.send('INSTALL_ATTRIBUTED', { ...parsed })
       this._log('Install attributed:', parsed)
     }
@@ -791,7 +834,6 @@ export class NohmoRNTracker {
       platform: Platform.OS as 'ios' | 'android',
       appVersion: this.config.appVersion,
       ...(Object.keys(this.deepLinkUtm).length > 0 ? { utm: this.deepLinkUtm } : {}),
-      ...(Object.keys(this.installAttr).length > 0 ? { install_utm: this.installAttr } : {}),
     }
     if (!this.deviceId) { this.pendingEvents.push(partial); return }
     this.queue.push({ ...partial, deviceId: this.deviceId , sdk: SDK_NAME, sdkVersion: SDK_VERSION })
@@ -862,6 +904,7 @@ export class NohmoRNTracker {
     if (nextState === 'background') {
       if (this.backgrounded) return
       this.backgrounded = true
+      this.backgroundedAt = Date.now()
       const secs = Math.round((Date.now() - this.sessionStart) / 1000)
       if (secs > 0) {
         this.send('APP_BACKGROUND', {
@@ -874,10 +917,29 @@ export class NohmoRNTracker {
       // before the OS may kill the process, and the flush might not complete.
       void this._persistQueue().then(() => this._flush())
     } else if (nextState === 'active') {
-      // Only a genuine return from background starts a new session; the
-      // 'active' that arrives moments after launch is not one.
+      // Only a genuine return from background is considered; the 'active' that
+      // arrives moments after launch is not one.
       if (!this.backgrounded) return
       this.backgrounded = false
+
+      // Time in another app is not time on the screen the user left open,
+      // so the screen clock restarts either way.
+      this.screenStart = Date.now()
+
+      const awayMs = Date.now() - this.backgroundedAt
+      if (awayMs < this.config.sessionTimeout) {
+        // Reading an OTP, approving a payment, picking a photo. A few seconds
+        // elsewhere is not a new visit, and minting a session for it split every
+        // real journey in two and inflated the session count. No APP_OPEN
+        // either: the app was never really re-opened.
+        //
+        // The session clock moves forward by the time away, so
+        // sessionDurationSecs stays a measure of time spent IN the app.
+        this.sessionStart += awayMs
+        this._log(`Resumed session ${this.sessionId} after ${awayMs}ms away`)
+        return
+      }
+
       this.sessionId = genId('sess')
       this.sessionStart = Date.now()
       this._syncCrashContext()
@@ -940,7 +1002,6 @@ export class NohmoRNTracker {
         sdk: e.sdk,
         sdkVersion: e.sdkVersion,
         ...(e.utm ? { utm: e.utm } : {}),
-        ...(e.install_utm ? { install_utm: e.install_utm } : {}),
       })),
       apiKey: this.config.apiKey,
     })
@@ -1064,7 +1125,9 @@ export class NohmoRNTracker {
   }
 
   destroy() {
+    this.destroyed = true
     if (this.flushTimer) clearInterval(this.flushTimer)
+    this.flushTimer = null
     if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = null }
     void this._persistQueue()
     this.appStateSubscription?.remove()
