@@ -1,5 +1,5 @@
 /**
- * Tests for the Node server SDK, run against the BUILT bundle (dist/server.cjs.js), not
+ * Tests for the Node server SDK, run against the BUILT bundle (dist/server.cjs), not
  * the TypeScript source — so packaging mistakes (a bad exports map, a node built-in that
  * got shimmed away) fail here rather than in a customer's app.
  *

@@ -1,2 +1,2 @@
 'use strict'
-module.exports = require('../dist/autocapture.cjs.js')
+module.exports = require('../dist/autocapture.cjs')
