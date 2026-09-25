@@ -168,6 +168,8 @@ a line starting `[Nohmo]`:
 
 ## Track custom events
 
+> React Native app? Import from `nohmo/react-native` instead — see [React Native](#react-native-ios--android).
+
 ```tsx
 import { useNohmo } from 'nohmo'
 
@@ -185,6 +187,8 @@ export default function BuyButton({ item }: { item: { id: string; price: number 
 Events are queued in memory and flushed as a batch every `flushInterval` ms via `navigator.sendBeacon` (falling back to `fetch`). They survive page unload and never block the main thread.
 
 ## Identify users after login
+
+> React Native app? Import from `nohmo/react-native` instead — see [Identify users](#identify-users).
 
 ```tsx
 import { useNohmo } from 'nohmo'
@@ -268,6 +272,11 @@ export default function App() {
 ```
 
 If you skip `storage`, everything works — events are tracked, screens are recorded, users can be identified — you just won't get returning-device recognition after an app kill.
+
+> **Import hooks from `nohmo/react-native` too — never from `nohmo`.** `'nohmo'` is the
+> web SDK. Its `useNohmo()` reads a different context from the React Native provider, so in
+> an app it hands back placeholder functions: `linkUser`, `send` and `trackConversion` resolve
+> without error and send nothing. Watch for editor auto-import picking `'nohmo'`.
 
 ### Surviving a reinstall
 
@@ -442,6 +451,8 @@ app. If the `Page` column never changes, screen tracking is not wired.
 ### Custom events
 
 ```tsx
+import { useNohmo } from 'nohmo/react-native'
+
 const { send } = useNohmo()
 
 send('button_tapped', { buttonId: 'cta_signup' })
@@ -451,6 +462,8 @@ send('checkout_started', { cartValue: 49.99 })
 ### Identify users
 
 ```tsx
+import { useNohmo } from 'nohmo/react-native'
+
 const { linkUser } = useNohmo()
 
 // After login
@@ -476,6 +489,8 @@ costs no request on later launches.
 ### Track conversions
 
 ```tsx
+import { useNohmo } from 'nohmo/react-native'
+
 const { trackConversion } = useNohmo()
 
 trackConversion('user_created')
@@ -762,6 +777,8 @@ Go to **Settings → Conversions** and create a goal. Each goal has a human-read
 | Subscription Started | `subscription_started` |
 
 ### 2. Call `trackConversion()` in your code
+
+> React Native app? Import `useNohmo` from `nohmo/react-native`, not `nohmo`.
 
 ```tsx
 import { useNohmo } from 'nohmo'
